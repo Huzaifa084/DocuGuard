@@ -12,6 +12,7 @@ Pages:
 
 from __future__ import annotations
 
+import os
 import streamlit as st
 
 # ---------------------------------------------------------------------------
@@ -82,16 +83,42 @@ def _sidebar():
 def _page_analysis():
     st.header("📄 Document Analysis")
     st.markdown(
-        "Upload a document (PDF, DOCX, or TXT) for AI detection, plagiarism "
-        "checking, and optional humanization."
+        "Upload a document (PDF, DOCX, or TXT) **or** paste your text directly "
+        "for AI detection, plagiarism checking, and optional humanization."
     )
 
-    uploaded = st.file_uploader(
-        "Choose a file",
-        type=["pdf", "docx", "txt"],
-        key="doc_upload",
-    )
+    # ---- Input method tabs ----
+    tab_upload, tab_paste = st.tabs(["📁 Upload File", "📋 Paste Text"])
 
+    uploaded = None
+    pasted_text = ""
+
+    with tab_upload:
+        uploaded = st.file_uploader(
+            "Choose a file",
+            type=["pdf", "docx", "txt"],
+            key="doc_upload",
+        )
+
+    with tab_paste:
+        pasted_text = st.text_area(
+            "Paste your text below",
+            height=300,
+            placeholder="Paste content from Google Docs, MS Word, or any source …",
+            key="doc_paste",
+        )
+        paste_title = st.text_input(
+            "Document title (optional)",
+            value="Pasted Document",
+            key="paste_title",
+        )
+
+        # ---- Live formatted preview ----
+        if pasted_text.strip():
+            with st.expander("📖 Formatted Preview", expanded=True):
+                st.markdown(_plain_to_markdown(pasted_text), unsafe_allow_html=True)
+
+    # ---- Analysis options ----
     col_opts1, col_opts2 = st.columns(2)
     with col_opts1:
         run_plagiarism = st.checkbox("Run plagiarism check", value=True)
@@ -108,21 +135,64 @@ def _page_analysis():
             st.warning("No style profiles found. Create one in the Style Profiles page.")
             run_fingerprint = False
 
-    if uploaded is not None and st.button("🔍 Analyse Document", type="primary"):
-        _run_analysis(uploaded, run_plagiarism, run_fingerprint, profile_name)
+    # ---- Determine which input to use ----
+    has_input = uploaded is not None or pasted_text.strip()
+
+    if has_input and st.button("🔍 Analyse Document", type="primary"):
+        if uploaded is not None:
+            _run_analysis_file(uploaded, run_plagiarism, run_fingerprint, profile_name)
+        elif pasted_text.strip():
+            _run_analysis_text(pasted_text.strip(), paste_title, run_plagiarism, run_fingerprint, profile_name)
 
 
-def _run_analysis(uploaded, run_plagiarism: bool, run_fingerprint: bool, profile_name: str):
+def _run_analysis_file(uploaded, run_plagiarism: bool, run_fingerprint: bool, profile_name: str):
+    """Analyse from an uploaded file."""
     from core.document_processor import process_document
-    from core.report_generator import generate_report, save_report
-    from db.history_store import add_analysis
 
     file_bytes = uploaded.read()
     filename = uploaded.name
 
-    # --- Step 1: Document processing ---
     with st.spinner("Extracting text …"):
         doc = process_document(file_bytes, filename)
+
+    _run_analysis_common(doc, filename, run_plagiarism, run_fingerprint, profile_name)
+
+
+def _run_analysis_text(text: str, title: str, run_plagiarism: bool, run_fingerprint: bool, profile_name: str):
+    """Analyse from pasted text — build a DocumentResult directly."""
+    from core.document_processor import DocumentResult, DocumentMetadata
+    from utils.text_utils import clean_text, split_sentences, split_paragraphs, count_words
+
+    with st.spinner("Processing text …"):
+        cleaned = clean_text(text)
+        sentences = split_sentences(cleaned)
+        paragraphs = split_paragraphs(cleaned)
+        wc = count_words(cleaned)
+
+        filename = f"{title}.txt" if not title.endswith(".txt") else title
+        meta = DocumentMetadata(
+            filename=filename,
+            word_count=wc,
+            sentence_count=len(sentences),
+            paragraph_count=len(paragraphs),
+            char_count=len(cleaned),
+            avg_sentence_length=wc / len(sentences) if sentences else 0.0,
+        )
+        doc = DocumentResult(
+            raw_text=text,
+            cleaned_text=cleaned,
+            sentences=sentences,
+            paragraphs=paragraphs,
+            metadata=meta,
+        )
+
+    _run_analysis_common(doc, filename, run_plagiarism, run_fingerprint, profile_name)
+
+
+def _run_analysis_common(doc, filename: str, run_plagiarism: bool, run_fingerprint: bool, profile_name: str):
+    """Shared analysis pipeline for both file-upload and pasted-text inputs."""
+    from core.report_generator import generate_report, save_report
+    from db.history_store import add_analysis
 
     if doc.metadata.word_count == 0:
         st.error("No text could be extracted from the file.")
@@ -335,6 +405,27 @@ def _render_humanize_tab():
         ],
     )
 
+    # Show model selector when LLM strategy is chosen
+    model_name = "mistral"
+    if strategy == "llm":
+        model_name = st.selectbox(
+            "LLM Model",
+            ["mistral", "llama3"],
+            help="Select which Ollama model to use for rewriting.",
+        )
+        # Show Ollama connectivity status
+        import requests as _req
+        _ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        try:
+            _r = _req.get(f"{_ollama_url}/api/tags", timeout=3)
+            _models = [m["name"] for m in _r.json().get("models", [])]
+            if _models:
+                st.success(f"Ollama connected — available models: {', '.join(_models)}")
+            else:
+                st.warning("Ollama running but no models pulled. Run `docker exec ollama ollama pull mistral`")
+        except Exception:
+            st.error(f"Cannot reach Ollama at {_ollama_url}. Is the container running?")
+
     if st.button("🔄 Humanize & Re-evaluate", type="primary"):
         doc = st.session_state["last_doc"]
         ai_before = st.session_state["last_ai_result"]
@@ -342,7 +433,7 @@ def _render_humanize_tab():
         humanizer = _load_humanizer()
 
         with st.spinner("Humanizing text …"):
-            h_result = humanizer.humanize(doc.cleaned_text, strategy=strategy)
+            h_result = humanizer.humanize(doc.cleaned_text, strategy=strategy, model=model_name)
 
         with st.spinner("Re-evaluating humanized text …"):
             detector = _load_ai_detector()
@@ -514,7 +605,7 @@ def _page_history():
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _verdict_label(prob: float) -> str:
@@ -523,6 +614,109 @@ def _verdict_label(prob: float) -> str:
     if prob >= 0.45:
         return "mixed"
     return "likely_human"
+
+
+def _plain_to_markdown(text: str) -> str:
+    """Convert plain text (pasted from Google Docs / Word) into rich HTML.
+
+    Uses HTML rather than pure Markdown so that every line break is respected
+    exactly as the user pasted it — matching the look of Google Docs / Word.
+
+    Heuristics:
+      - First non-blank line → large title
+      - Short standalone lines (≤ 10 words, no period) → section headings
+      - "3.1 …" lines → indented bold-numbered sub-items
+      - "3. …" lines → bold numbered sections
+      - Bullet chars → list items
+      - Regular text → paragraphs
+      - Blank lines → visual paragraph breaks
+    """
+    import re
+
+    lines = text.split("\n")
+    html_parts: list[str] = []
+    title_emitted = False
+    prev_blank = True
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+
+        # Blank line → spacer
+        if not line.strip():
+            html_parts.append('<div style="height:0.6em"></div>')
+            prev_blank = True
+            continue
+
+        stripped = line.strip()
+        words = stripped.split()
+        is_short = len(words) <= 10
+        no_period = not stripped.endswith((".", ",", ";", ":"))
+        has_sub_num = bool(re.match(r"^\d+\.\d+", stripped))
+        has_chap_num = bool(re.match(r"^\d+\.\s", stripped))
+
+        # ---- Numbered sub-section "3.1 Title" ----
+        m_sub = re.match(r"^(\d+\.\d+)\s+(.+)$", stripped)
+        if m_sub and len(words) <= 12 and no_period:
+            html_parts.append(
+                f'<div style="padding-left:2em;margin:2px 0">'
+                f'<b>{m_sub.group(1)}</b>&ensp;{_esc(m_sub.group(2))}</div>'
+            )
+            prev_blank = False
+            continue
+
+        # ---- Chapter numbering "3. Introduction" ----
+        m_chap = re.match(r"^(\d+)\.\s+(.+)$", stripped)
+        if m_chap and len(words) <= 8 and no_period:
+            html_parts.append(
+                f'<div style="margin:6px 0;font-weight:600">'
+                f'{m_chap.group(1)}. {_esc(m_chap.group(2))}</div>'
+            )
+            prev_blank = False
+            continue
+
+        # ---- Heading detection ----
+        if is_short and no_period and not has_sub_num and not has_chap_num:
+            if not title_emitted:
+                html_parts.append(
+                    f'<h2 style="margin:0.2em 0 0.3em">{_esc(stripped)}</h2>'
+                )
+                title_emitted = True
+                prev_blank = False
+                continue
+
+            if prev_blank:
+                html_parts.append(
+                    f'<h4 style="margin:0.5em 0 0.2em">{_esc(stripped)}</h4>'
+                )
+                prev_blank = False
+                continue
+
+            # Short line not after blank → TOC-style entry
+            html_parts.append(
+                f'<div style="margin:1px 0"><b>{_esc(stripped)}</b></div>'
+            )
+            prev_blank = False
+            continue
+
+        # ---- Bullet chars ----
+        if re.match(r"^[-*•○◦]\s", stripped):
+            html_parts.append(
+                f'<div style="padding-left:1.5em;margin:2px 0">'
+                f'• {_esc(stripped[2:].strip())}</div>'
+            )
+            prev_blank = False
+            continue
+
+        # ---- Regular paragraph ----
+        html_parts.append(f'<p style="margin:0.3em 0">{_esc(stripped)}</p>')
+        prev_blank = False
+
+    return "\n".join(html_parts)
+
+
+def _esc(text: str) -> str:
+    """Minimal HTML escaping for user text."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------------------------------------------------------------------------

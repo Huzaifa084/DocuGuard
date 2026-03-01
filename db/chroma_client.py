@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 chroma_client.py
 ----------------
