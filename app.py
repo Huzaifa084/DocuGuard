@@ -144,6 +144,16 @@ def _page_analysis():
         elif pasted_text.strip():
             _run_analysis_text(pasted_text.strip(), paste_title, run_plagiarism, run_fingerprint, profile_name)
 
+    # --- Always render results from session state (survives reruns) ---
+    if "last_report" in st.session_state:
+        _display_results(
+            st.session_state["last_report"],
+            st.session_state["last_doc"],
+            st.session_state["last_ai_result"],
+            st.session_state.get("last_plag_result"),
+            st.session_state.get("last_fp_result"),
+        )
+
 
 def _run_analysis_file(uploaded, run_plagiarism: bool, run_fingerprint: bool, profile_name: str):
     """Analyse from an uploaded file."""
@@ -242,13 +252,12 @@ def _run_analysis_common(doc, filename: str, run_plagiarism: bool, run_fingerpri
         fingerprint_similarity=fp_result.similarity_score if fp_result else None,
     )
 
-    # --- Store in session for humanization ---
+    # --- Store ALL results in session for re-rendering & humanization ---
     st.session_state["last_doc"] = doc
     st.session_state["last_ai_result"] = ai_result
     st.session_state["last_report"] = report
-
-    # --- Display results ---
-    _display_results(report, doc, ai_result, plag_result, fp_result)
+    st.session_state["last_plag_result"] = plag_result
+    st.session_state["last_fp_result"] = fp_result
 
 
 def _display_results(report, doc, ai_result, plag_result, fp_result):
