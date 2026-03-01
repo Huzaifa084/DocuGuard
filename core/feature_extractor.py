@@ -75,10 +75,24 @@ def extract_features(text: str) -> Dict[str, Any]:
     features.update(_vocabulary_metrics(words))
 
     # ---- Grammar patterns --------------------------------------------------
-    features.update(_grammar_patterns(text, words))
+    features.update(_grammar_patterns(text, words, sentences))
 
     # ---- Style indicators --------------------------------------------------
     features.update(_style_indicators(text, sentences, words))
+
+    # ---- Paragraph metrics (used by expanded StyleAnalyser) ---------------
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if paragraphs:
+        para_lengths = [len(p.split()) for p in paragraphs]
+        para_mean = sum(para_lengths) / len(para_lengths)
+        para_std = math.sqrt(
+            sum((l - para_mean) ** 2 for l in para_lengths) / len(para_lengths)
+        ) if len(para_lengths) > 1 else 0.0
+        features["paragraph_length_mean"] = round(para_mean, 3)
+        features["paragraph_length_std"] = round(para_std, 3)
+    else:
+        features["paragraph_length_mean"] = 0.0
+        features["paragraph_length_std"] = 0.0
 
     # ---- Readability -------------------------------------------------------
     features["flesch_reading_ease"] = flesch_reading_ease(text)
@@ -187,17 +201,17 @@ def _yules_k(freq: Counter, n: int) -> float:
 # Grammar patterns
 # ---------------------------------------------------------------------------
 
-def _grammar_patterns(text: str, words: List[str]) -> Dict[str, float]:
+def _grammar_patterns(text: str, words: List[str], sentences: List[str]) -> Dict[str, float]:
     if not words:
         return {
             "passive_voice_ratio": 0.0,
             "stopword_ratio": 0.0,
             "modal_verb_ratio": 0.0,
+            "conjunction_ratio": 0.0,
         }
 
-    # ---- Passive voice detection (heuristic: "be" form + past participle) --
-    passive_count = _count_passive_voice(text)
-    sentences = split_sentences(text)
+    # ---- Passive voice detection (batch POS-tag) ---
+    passive_count = _count_passive_voice_batch(sentences)
     passive_ratio = passive_count / len(sentences) if sentences else 0.0
 
     # ---- Stopword frequency --
@@ -210,33 +224,63 @@ def _grammar_patterns(text: str, words: List[str]) -> Dict[str, float]:
     modal_count = sum(1 for w in words if w in modals)
     modal_ratio = modal_count / len(words)
 
+    # ---- Coordinating conjunctions --
+    conjunctions = {"and", "but", "or", "nor", "for", "yet", "so"}
+    conj_count = sum(1 for w in words if w in conjunctions)
+    conj_ratio = conj_count / len(words)
+
     return {
         "passive_voice_ratio": round(passive_ratio, 4),
         "stopword_ratio": round(stopword_ratio, 4),
         "modal_verb_ratio": round(modal_ratio, 4),
+        "conjunction_ratio": round(conj_ratio, 4),
     }
 
 
-def _count_passive_voice(text: str) -> int:
-    """Heuristic passive voice counter via POS tagging."""
-    sentences = split_sentences(text)
-    passive_count = 0
-    be_forms = {"am", "is", "are", "was", "were", "be", "been", "being"}
+def _count_passive_voice_batch(sentences: List[str]) -> int:
+    """Batch-POS-tag all sentences at once, then detect passive constructions.
 
+    Previous implementation called ``nltk.pos_tag()`` per sentence (N calls).
+    This batches everything into a single tag operation, then splits by
+    sentence boundaries.
+    """
+    if not sentences:
+        return 0
+
+    be_forms = {"am", "is", "are", "was", "were", "be", "been", "being"}
+    passive_count = 0
+
+    # Tokenise all sentences first, remember boundaries
+    all_tokens: List[str] = []
+    boundaries: List[int] = []  # end index of each sentence's tokens
     for sent in sentences:
         try:
             tokens = nltk.word_tokenize(sent)
-            tagged = nltk.pos_tag(tokens)
         except Exception:
-            continue
+            tokens = sent.split()
+        all_tokens.extend(tokens)
+        boundaries.append(len(all_tokens))
 
-        for i in range(len(tagged) - 1):
-            word, tag = tagged[i]
-            next_word, next_tag = tagged[i + 1]
-            # "be" form followed by past participle (VBN)
+    if not all_tokens:
+        return 0
+
+    # Single POS-tag call for the whole document
+    try:
+        all_tagged = nltk.pos_tag(all_tokens)
+    except Exception:
+        return 0
+
+    # Walk through sentence boundaries and detect passive voice
+    start = 0
+    for end in boundaries:
+        tagged_sent = all_tagged[start:end]
+        for i in range(len(tagged_sent) - 1):
+            word, _tag = tagged_sent[i]
+            _next_word, next_tag = tagged_sent[i + 1]
             if word.lower() in be_forms and next_tag == "VBN":
                 passive_count += 1
                 break  # count once per sentence
+        start = end
 
     return passive_count
 

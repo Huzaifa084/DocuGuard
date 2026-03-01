@@ -42,6 +42,9 @@ log = logging.getLogger(__name__)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("DEFAULT_OLLAMA_MODEL", "mistral")
 
+# Hard word-count limit — keeps LLM processing tractable
+MAX_WORD_LIMIT: int = 8000
+
 # Ollama generation parameters – tuned for varied, creative output
 _GENERATION_OPTIONS: dict[str, Any] = {
     "temperature": 0.85,         # Higher → more diverse word choice
@@ -52,12 +55,28 @@ _GENERATION_OPTIONS: dict[str, Any] = {
 }
 
 # Thresholds
-_TARGET_AI_PROB = 0.35           # Stop iterating once AI prob is below this
-_MAX_PASSES = 2                  # Maximum LLM rewriting passes
+_TARGET_AI_PROB = 0.30           # Stop iterating once AI prob is below this
+_MAX_PASSES = 3                  # Maximum LLM rewriting passes
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
+
+@dataclass
+class HumanizationConfig:
+    """User-controllable knobs for the LLM humanization pipeline.
+
+    Passed from the Streamlit UI so that the LLM can tailor its rewriting
+    to the user's specific needs.
+    """
+    tone: str = "academic"              # academic | casual | professional | creative
+    intensity: str = "balanced"         # light | balanced | aggressive
+    domain: str = ""                    # e.g. "computer science", "history"
+    preserve_keywords: str = ""         # comma-separated terms to keep verbatim
+    custom_instructions: str = ""       # free-form notes for the LLM
+    target_ai_prob: float = 0.30        # stop once AI prob drops below this
+    max_passes: int = 3                 # cap on LLM rewriting iterations
+
 
 @dataclass
 class HumanizationResult:
@@ -68,6 +87,9 @@ class HumanizationResult:
     changes_summary: List[str] = field(default_factory=list)
     ai_prob_before: Optional[float] = None
     ai_prob_after: Optional[float] = None
+    word_count_original: int = 0
+    word_count_humanized: int = 0
+    passes_used: int = 0
 
 
 # Type alias for an optional progress callback (stage_name, pct)
@@ -87,13 +109,15 @@ class Humanizer:
         strategy: str = "rule-based",
         model: str = DEFAULT_MODEL,
         progress_cb: ProgressCallback = None,
+        config: Optional[HumanizationConfig] = None,
     ) -> HumanizationResult:
         """Rewrite *text* to improve naturalness.
 
         Parameters
         ----------
         text :
-            The cleaned document text.
+            The cleaned document text.  Capped at ``MAX_WORD_LIMIT`` words;
+            excess text is reattached after processing.
         strategy :
             ``"rule-based"`` (default, offline) or ``"llm"`` (requires Ollama).
         model :
@@ -101,15 +125,44 @@ class Humanizer:
         progress_cb :
             Optional ``(stage_name: str, progress: float)`` callback for UI
             progress bars.  *progress* goes from 0.0 → 1.0.
+        config :
+            ``HumanizationConfig`` with user preferences (tone, intensity,
+            domain, custom instructions, etc.).  If *None*, defaults apply.
 
         Returns
         -------
         HumanizationResult
             Contains original, rewritten text, and a summary of changes.
         """
+        cfg = config or HumanizationConfig()
+
+        # ── Word-count enforcement ──────────────────────────────────────
+        words = text.split()
+        overflow = ""
+        if len(words) > MAX_WORD_LIMIT:
+            overflow = " ".join(words[MAX_WORD_LIMIT:])
+            text = " ".join(words[:MAX_WORD_LIMIT])
+            log.info(
+                "Input truncated to %d words (overflow: %d words kept as-is)",
+                MAX_WORD_LIMIT, len(overflow.split()),
+            )
+
         if strategy == "llm":
-            return self._llm_humanize(text, model, progress_cb)
-        return self._rule_based_humanize(text)
+            result = self._llm_humanize(text, model, progress_cb, cfg)
+        else:
+            result = self._rule_based_humanize(text)
+
+        # Reattach overflow (un-processed tail) if any
+        if overflow:
+            result.humanized_text = result.humanized_text.rstrip() + "\n\n" + overflow
+            result.changes_summary.append(
+                f"Note: only the first {MAX_WORD_LIMIT:,} words were processed; "
+                f"{len(overflow.split()):,} trailing words appended unchanged."
+            )
+
+        result.word_count_original = len(result.original_text.split())
+        result.word_count_humanized = len(result.humanized_text.split())
+        return result
 
     # ------------------------------------------------------------------
     # Rule-based transforms
@@ -208,84 +261,115 @@ class Humanizer:
     # ------------------------------------------------------------------
 
     def _llm_humanize(
-        self, text: str, model: str, progress_cb: ProgressCallback = None,
+        self,
+        text: str,
+        model: str,
+        progress_cb: ProgressCallback = None,
+        config: Optional[HumanizationConfig] = None,
     ) -> HumanizationResult:
         """Production-grade LLM humanization pipeline.
 
-        Pipeline stages
-        ----------------
-        1. **Paragraph-level rewriting** — split text into paragraphs; rewrite
-           each one independently so the LLM can focus on quality.
-        2. **AI-detection gate** — run our own detector on the reassembled text.
-           If AI probability < target, stop early.
-        3. **Targeted second pass** — feed the detector's *specific* flagged
-           signals back to the LLM with instructions to fix them.
-        4. **Rule-based polish** — apply contractions, transition cleanup, and
-           vocabulary simplification as a final pass.
+        Pipeline
+        --------
+        0. **Pre-analysis** — run AI detector to identify *what makes the text
+           AI-like* before any rewriting begins.
+        1. **Context-aware paragraph rewriting** — paragraphs are rewritten one
+           at a time, but the LLM receives the *previous* and *next* paragraph
+           as read-only context for coherence.
+        2. **AI-detection gate** — check AI probability after the pass.
+        3. **Sentence-level targeted fixes** — individual high-AI-probability
+           sentences identified by the detector are rewritten individually.
+        4. **Iterative loop** (up to ``config.max_passes``) — if AI probability
+           is still above the target, run another full-pass with the latest
+           diagnosis.
+        5. **Rule-based polish** — contractions, transition cleanup, vocabulary
+           simplification.
+
+        The entire pipeline processes **all text** (up to the word-count cap).
         """
+        cfg = config or HumanizationConfig()
+        target_prob = cfg.target_ai_prob
+        max_passes = min(cfg.max_passes, _MAX_PASSES)
         changes: List[str] = []
         _cb = progress_cb or (lambda *_: None)
+        passes_used = 0
 
-        # ── Stage 1: paragraph-level rewriting ──────────────────────────
-        _cb("Splitting into paragraphs …", 0.0)
-        paragraphs = _split_into_paragraphs(text)
-        log.info("LLM humanize: %d paragraphs", len(paragraphs))
-
-        rewritten_parts: List[str] = []
-        for idx, para in enumerate(paragraphs):
-            _cb(f"Rewriting paragraph {idx + 1}/{len(paragraphs)} …",
-                (idx / len(paragraphs)) * 0.55)
-
-            if len(para.split()) < 5:
-                # Too short — pass through
-                rewritten_parts.append(para)
-                continue
-
-            rewritten = self._rewrite_paragraph(para, model, pass_number=1)
-            rewritten_parts.append(rewritten)
-
-        draft_1 = "\n\n".join(rewritten_parts)
-        changes.append(f"Pass 1: rewrote {len(paragraphs)} paragraphs via {model}")
-
-        # ── Stage 2: AI-detection gate ──────────────────────────────────
-        _cb("Evaluating AI probability …", 0.60)
+        # ── Stage 0: Pre-analysis ───────────────────────────────────────
+        _cb("Analysing text before rewriting …", 0.0)
+        pre_features: Dict[str, Any] = {}
+        pre_explanations: List[str] = []
+        pre_ai_prob = 1.0
         try:
             from core.ai_detector import AIDetector
             detector = AIDetector()
-            gate_result = detector.detect(draft_1)
-            ai_prob = gate_result.ai_probability
-            flagged = gate_result.explanations
-            features = gate_result.features
+            pre_result = detector.detect(text)
+            pre_ai_prob = pre_result.ai_probability
+            pre_features = pre_result.features
+            pre_explanations = pre_result.explanations
             changes.append(
-                f"Mid-pipeline AI prob: {ai_prob:.0%} "
-                f"(perplexity {gate_result.perplexity_result.perplexity:.1f})"
+                f"Pre-analysis: AI prob {pre_ai_prob:.0%}, "
+                f"perplexity {pre_result.perplexity_result.perplexity:.1f}"
             )
-            log.info("Post-pass-1 AI prob: %.2f", ai_prob)
         except Exception as exc:
-            log.warning("AI detection gate failed: %s", exc)
-            ai_prob = 1.0  # Assume worst case → trigger pass 2
-            flagged = []
-            features = {}
+            log.warning("Pre-analysis failed: %s", exc)
 
-        # ── Stage 3: targeted second pass (only if still flagged) ───────
-        if ai_prob >= _TARGET_AI_PROB and _MAX_PASSES >= 2:
-            _cb("Targeted second pass …", 0.65)
+        # Build dynamic system prompt incorporating user preferences
+        sys_prompt = self._build_system_prompt(cfg, pre_features, pre_explanations)
 
-            # Build a diagnosis string the LLM can act on
-            diagnosis = _build_diagnosis(ai_prob, features, flagged)
-            log.info("Pass 2 diagnosis:\n%s", diagnosis)
+        # ── Stage 1: context-aware paragraph rewriting ──────────────────
+        _cb("Splitting into paragraphs …", 0.03)
+        paragraphs = _split_into_paragraphs(text)
+        n_paras = len(paragraphs)
+        log.info("LLM humanize: %d paragraphs, model=%s", n_paras, model)
 
-            # Rewrite the entire draft again with specific fixes
-            pass2 = self._targeted_rewrite(draft_1, model, diagnosis)
-            if pass2 and len(pass2.split()) > len(draft_1.split()) * 0.4:
-                draft_1 = pass2
-                changes.append("Pass 2: targeted fixes for flagged AI signals")
-            else:
-                changes.append("Pass 2: skipped (LLM output too short or empty)")
+        draft = self._rewrite_all_paragraphs(
+            paragraphs, model, sys_prompt, _cb,
+            progress_start=0.05, progress_end=0.45,
+        )
+        passes_used += 1
+        changes.append(f"Pass 1: rewrote {n_paras} paragraphs via {model}")
 
-        # ── Stage 4: rule-based polish ──────────────────────────────────
-        _cb("Final rule-based polish …", 0.85)
-        polished = self._rule_polish(draft_1)
+        # ── Iterative AI-detection gate + targeted passes ───────────────
+        for pass_num in range(2, max_passes + 1):
+            # Check AI probability
+            gate_pct = 0.45 + (pass_num - 2) * 0.15
+            _cb(f"AI detection gate (pass {pass_num - 1} result) …", gate_pct)
+            ai_prob, features, explanations = self._run_detection_gate(draft)
+            changes.append(
+                f"Post-pass-{pass_num - 1} AI prob: {ai_prob:.0%}"
+            )
+            log.info("Post-pass-%d AI prob: %.2f", pass_num - 1, ai_prob)
+
+            if ai_prob < target_prob:
+                changes.append(f"AI prob {ai_prob:.0%} < target {target_prob:.0%} — stopping early")
+                break
+
+            # Build diagnosis from latest detection
+            diagnosis = _build_diagnosis(ai_prob, features, explanations)
+
+            # Sentence-level targeted fixes for the worst offenders
+            _cb(f"Sentence-level fixes (pass {pass_num}) …", gate_pct + 0.03)
+            draft, n_fixed = self._fix_worst_sentences(
+                draft, model, cfg, diagnosis,
+            )
+            if n_fixed:
+                changes.append(f"Pass {pass_num}: fixed {n_fixed} high-AI sentences")
+
+            # Full targeted rewrite if still above threshold
+            ai_prob2, features2, explanations2 = self._run_detection_gate(draft)
+            if ai_prob2 >= target_prob:
+                _cb(f"Full targeted rewrite (pass {pass_num}) …", gate_pct + 0.07)
+                diagnosis2 = _build_diagnosis(ai_prob2, features2, explanations2)
+                rewritten = self._targeted_rewrite(draft, model, diagnosis2, cfg)
+                if rewritten and len(rewritten.split()) > len(draft.split()) * 0.4:
+                    draft = rewritten
+                    changes.append(f"Pass {pass_num}: full targeted rewrite")
+
+            passes_used += 1
+
+        # ── Final rule-based polish ─────────────────────────────────────
+        _cb("Final rule-based polish …", 0.90)
+        polished = self._rule_polish(draft)
         changes.append("Final polish: contractions, transitions, vocabulary")
 
         _cb("Done", 1.0)
@@ -295,7 +379,135 @@ class Humanizer:
             humanized_text=polished,
             strategy="llm",
             changes_summary=changes,
+            passes_used=passes_used,
         )
+
+    # ------------------------------------------------------------------
+    # Dynamic prompt builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_system_prompt(
+        cfg: HumanizationConfig,
+        pre_features: Dict[str, Any],
+        pre_explanations: List[str],
+    ) -> str:
+        """Construct a system prompt tailored to user config + pre-analysis."""
+
+        # ── Tone mapping ────────────────────────────────────────────────
+        tone_guide = {
+            "academic": (
+                "Write in a scholarly but readable style.  Use field-specific "
+                "terminology where appropriate, but prefer clarity over jargon. "
+                "Contractions are acceptable when they improve flow."
+            ),
+            "casual": (
+                "Write informally — like a knowledgeable friend explaining "
+                "something over coffee.  Use contractions, short punchy "
+                "sentences, and occasional humor or rhetorical questions."
+            ),
+            "professional": (
+                "Write in a polished business-appropriate tone.  Be concise, "
+                "direct, and authoritative.  Use contractions sparingly."
+            ),
+            "creative": (
+                "Write with flair — vivid verbs, varied rhythm, unexpected "
+                "word choices.  Let personality shine through while "
+                "preserving factual accuracy."
+            ),
+        }
+        tone_text = tone_guide.get(cfg.tone, tone_guide["academic"])
+
+        # ── Intensity mapping ───────────────────────────────────────────
+        intensity_guide = {
+            "light": (
+                "Make minimal changes.  Preserve the author's original "
+                "voice as much as possible; only fix the most obvious "
+                "AI patterns."
+            ),
+            "balanced": (
+                "Rewrite substantially but keep the core structure. "
+                "Break AI patterns while preserving factual content and "
+                "the general argument flow."
+            ),
+            "aggressive": (
+                "Rewrite boldly — restructure paragraphs, reorder "
+                "arguments, vary sentence lengths dramatically, introduce "
+                "surprising word choices.  The output should be virtually "
+                "unrecognisable as AI-generated."
+            ),
+        }
+        intensity_text = intensity_guide.get(cfg.intensity, intensity_guide["balanced"])
+
+        # ── Pre-analysis insights ───────────────────────────────────────
+        issues: List[str] = []
+        burstiness = pre_features.get("burstiness", 0.5)
+        if burstiness < 0.45:
+            issues.append(f"LOW BURSTINESS ({burstiness:.2f}) — sentence lengths too uniform")
+        ttr = pre_features.get("type_token_ratio", 0.6)
+        if ttr < 0.55:
+            issues.append(f"LOW VOCABULARY DIVERSITY (TTR={ttr:.2f})")
+        transition = pre_features.get("transition_word_ratio", 0)
+        if transition > 0.02:
+            issues.append(f"TRANSITION OVERUSE ({transition:.3f})")
+        passive = pre_features.get("passive_voice_ratio", 0)
+        if passive > 0.25:
+            issues.append(f"HIGH PASSIVE VOICE ({passive:.2f})")
+        starter_div = pre_features.get("sentence_starter_diversity", 1)
+        if starter_div < 0.6:
+            issues.append(f"LOW STARTER DIVERSITY ({starter_div:.2f})")
+
+        issues_block = ""
+        if issues:
+            bullet_list = "\n".join(f"  • {i}" for i in issues)
+            issues_block = (
+                f"\n\nPRE-ANALYSIS — the following AI signals were detected "
+                f"in the ORIGINAL text.  You MUST specifically fix these:\n"
+                f"{bullet_list}"
+            )
+
+        # ── Domain / keywords / custom ──────────────────────────────────
+        extras: List[str] = []
+        if cfg.domain:
+            extras.append(f"The text is about **{cfg.domain}**.  Use domain-appropriate vocabulary.")
+        if cfg.preserve_keywords:
+            extras.append(
+                f"These terms MUST appear verbatim (do not paraphrase them): "
+                f"{cfg.preserve_keywords}"
+            )
+        if cfg.custom_instructions:
+            extras.append(f"Additional user instructions: {cfg.custom_instructions}")
+        extras_block = "\n".join(extras)
+        if extras_block:
+            extras_block = "\n\n" + extras_block
+
+        return textwrap.dedent(f"""\
+            You are an expert writing coach specialising in making text
+            read as authentically human-written.  Your ONLY job is to
+            rewrite the user-provided text.
+
+            TONE: {tone_text}
+
+            INTENSITY: {intensity_text}
+
+            AI-generated text has these detectable patterns — BREAK them:
+            • Uniform sentence lengths → vary dramatically (3-word punchy + 30-word complex)
+            • Transition-word overuse (Furthermore/Moreover/Additionally) → remove or replace
+            • Predictable Subject-Verb-Object every sentence → vary syntax (inversions, fragments, questions)
+            • Low vocabulary diversity → synonyms, simpler words, domain-appropriate terms
+            • Overly formal register → contractions, asides, rhetorical questions where appropriate
+            • Uniform paragraph lengths → vary: one paragraph 2 sentences, next 6 sentences
+            • Overuse of passive voice → prefer active constructions
+            {issues_block}
+
+            HARD RULES:
+            1. Output ONLY the rewritten text.  No preamble, commentary, labels, or meta-text.
+            2. Preserve ALL factual content, claims, and nuance.
+            3. Keep roughly the same length (within ±20 %).
+            4. Never begin with "Here is" / "Sure" / "Certainly" or similar.
+            5. Do NOT add transition words (Moreover, Furthermore, Additionally, etc.).
+            {extras_block}
+        """)
 
     # ------------------------------------------------------------------
     # Ollama API helpers
@@ -307,8 +519,15 @@ class Humanizer:
         system_prompt: str,
         user_prompt: str,
         timeout: int = 300,
+        max_retries: int = 3,
     ) -> str:
-        """Call Ollama /api/chat with system + user messages."""
+        """Call Ollama /api/chat with system + user messages.
+
+        Includes exponential back-off retry for transient failures
+        (connection errors, 5xx from Ollama, timeouts).
+        """
+        import time
+
         payload = {
             "model": model,
             "messages": [
@@ -318,90 +537,261 @@ class Humanizer:
             "stream": False,
             "options": _GENERATION_OPTIONS,
         }
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/chat", json=payload, timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "").strip()
+
+        last_exc: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = requests.post(
+                    f"{OLLAMA_URL}/api/chat", json=payload, timeout=timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data.get("message", {}).get("content", "").strip()
+            except (requests.ConnectionError, requests.Timeout,
+                    requests.HTTPError) as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    wait = 2 ** attempt  # 2s, 4s
+                    log.warning(
+                        "Ollama call attempt %d/%d failed (%s), retrying in %ds …",
+                        attempt, max_retries, exc, wait,
+                    )
+                    time.sleep(wait)
+
+        raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------
-    # Pass 1: paragraph-level rewriting
+    # Context-aware paragraph rewriting
     # ------------------------------------------------------------------
 
-    _SYSTEM_PROMPT_P1 = textwrap.dedent("""\
-        You are an expert academic writing coach. Your ONLY job is to
-        rewrite user-provided text so it reads as authentically
-        human-written while keeping every factual claim intact.
+    def _rewrite_all_paragraphs(
+        self,
+        paragraphs: List[str],
+        model: str,
+        system_prompt: str,
+        progress_cb: Callable,
+        progress_start: float = 0.05,
+        progress_end: float = 0.45,
+    ) -> str:
+        """Rewrite every paragraph, passing neighbouring context."""
+        n = len(paragraphs)
+        rewritten: List[str] = []
 
-        AI-generated text has these detectable patterns that you MUST break:
-        • Uniform sentence lengths → vary dramatically (5-word punchy + 30-word complex)
-        • Transition-word overuse (Furthermore/Moreover/Additionally) → drop or replace
-        • Predictable Subject-Verb-Object structure every sentence → vary syntax
-        • Low vocabulary diversity  → use synonyms, simpler words, slang where apt
-        • Overly formal register   → add contractions, asides, rhetorical questions
+        for idx, para in enumerate(paragraphs):
+            pct = progress_start + (idx / max(n, 1)) * (progress_end - progress_start)
+            progress_cb(f"Rewriting paragraph {idx + 1}/{n} …", pct)
 
-        Rules:
-        1. Output ONLY the rewritten text.  No preamble, commentary, or labels.
-        2. Preserve all factual content and nuance.
-        3. Keep roughly the same length (within ±20 %).
-        4. Never add disclaimers like "Here is the rewritten text".
-    """)
+            if len(para.split()) < 5:
+                rewritten.append(para)
+                continue
 
-    def _rewrite_paragraph(self, paragraph: str, model: str, pass_number: int = 1) -> str:
-        """Rewrite a single paragraph via Ollama chat API."""
+            # Build context window: previous + next paragraph (read-only)
+            ctx_parts: List[str] = []
+            if idx > 0:
+                ctx_parts.append(f"[PREVIOUS PARAGRAPH — for context only, do NOT rewrite]\n{paragraphs[idx - 1]}")
+            ctx_parts.append(f"[REWRITE THIS PARAGRAPH]\n{para}")
+            if idx < n - 1:
+                ctx_parts.append(f"[NEXT PARAGRAPH — for context only, do NOT rewrite]\n{paragraphs[idx + 1]}")
+
+            user_msg = "\n\n".join(ctx_parts)
+
+            try:
+                result = self._ollama_chat(
+                    model=model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_msg,
+                    timeout=max(120, len(para.split()) * 3),
+                )
+                # Validate output
+                if result and len(result.split()) > len(para.split()) * 0.3:
+                    # Strip any accidentally included context paragraphs
+                    result = self._strip_context_leakage(result, paragraphs, idx)
+                    rewritten.append(result)
+                else:
+                    log.warning("Paragraph %d: LLM output too short, keeping original", idx)
+                    rewritten.append(para)
+            except Exception as exc:
+                log.warning("Paragraph %d rewrite failed: %s", idx, exc)
+                rewritten.append(para)
+
+        return "\n\n".join(rewritten)
+
+    @staticmethod
+    def _strip_context_leakage(
+        result: str, paragraphs: List[str], current_idx: int,
+    ) -> str:
+        """Remove accidentally repeated context paragraphs from LLM output."""
+        lines = result.strip().split("\n")
+        # Remove any lines that look like our context markers
+        filtered = [
+            ln for ln in lines
+            if not ln.strip().startswith("[PREVIOUS PARAGRAPH")
+            and not ln.strip().startswith("[NEXT PARAGRAPH")
+            and not ln.strip().startswith("[REWRITE THIS")
+        ]
+        return "\n".join(filtered).strip()
+
+    # ------------------------------------------------------------------
+    # AI-detection gate helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _run_detection_gate(text: str) -> tuple:
+        """Run AI detection and return (ai_prob, features, explanations)."""
         try:
-            result = self._ollama_chat(
-                model=model,
-                system_prompt=self._SYSTEM_PROMPT_P1,
-                user_prompt=paragraph,
-                timeout=max(120, len(paragraph.split()) * 2),
-            )
-            # Validate: not empty, not absurdly short
-            if result and len(result.split()) > len(paragraph.split()) * 0.3:
-                return result
-            log.warning("Pass %d: LLM output too short, keeping original", pass_number)
-            return paragraph
+            from core.ai_detector import AIDetector
+            detector = AIDetector()
+            result = detector.detect(text)
+            return result.ai_probability, result.features, result.explanations
         except Exception as exc:
-            log.warning("Pass %d LLM call failed: %s", pass_number, exc)
-            return paragraph
+            log.warning("Detection gate failed: %s", exc)
+            return 1.0, {}, []
 
     # ------------------------------------------------------------------
-    # Pass 2: targeted rewrite based on detector diagnosis
+    # Sentence-level targeted fixes
     # ------------------------------------------------------------------
 
-    _SYSTEM_PROMPT_P2 = textwrap.dedent("""\
-        You are an AI-text remediation specialist. The user will give you:
-        1. A DIAGNOSIS section listing the exact AI signals detected.
-        2. The TEXT to fix.
+    def _fix_worst_sentences(
+        self,
+        text: str,
+        model: str,
+        cfg: HumanizationConfig,
+        diagnosis: str,
+        max_fixes: int = 10,
+    ) -> tuple[str, int]:
+        """Identify and rewrite the most "AI-like" individual sentences.
 
-        Your job: rewrite the text to specifically address EVERY flagged
-        issue in the diagnosis while keeping ALL facts intact.
+        Uses a lightweight per-sentence AI probability estimate (perplexity +
+        feature extraction on the sentence in context) to find the worst
+        offenders, then rewrites them one by one.
+        """
+        sentences = split_sentences(text)
+        if len(sentences) < 3:
+            return text, 0
 
-        Guidelines:
-        • If "low burstiness" → make sentence lengths dramatically uneven
-        • If "transition overuse" → remove or replace every transition starter
-        • If "low perplexity" → introduce surprises: unusual word choices,
-          rhetorical questions, parenthetical asides, sentence fragments
-        • If "uniformity" → break parallel structures, vary paragraph lengths
-        • If "vocabulary" → swap academic jargon for plain language
+        # Score each sentence by a quick heuristic:
+        # - starts with a flagged transition word
+        # - very close in length to the mean (low variance contribution)
+        # - uses passive voice
+        mean_len = sum(len(s.split()) for s in sentences) / len(sentences)
+        transition_starters = {
+            "furthermore", "moreover", "additionally", "consequently",
+            "nevertheless", "subsequently", "however", "therefore",
+            "interestingly", "notably", "importantly", "significantly",
+            "essentially", "ultimately", "indeed",
+        }
+        be_forms = {"am", "is", "are", "was", "were", "been", "being"}
 
-        Output ONLY the rewritten text.  No commentary.
-    """)
+        scored: List[tuple[int, float]] = []  # (index, ai_score)
+        for i, sent in enumerate(sentences):
+            score = 0.0
+            words = sent.split()
+            wlen = len(words)
+            if not words:
+                continue
 
-    def _targeted_rewrite(self, text: str, model: str, diagnosis: str) -> str:
-        """Run a targeted second-pass rewrite guided by detector diagnosis."""
+            # Transition starter
+            fw = words[0].lower().rstrip(",")
+            if fw in transition_starters:
+                score += 0.4
+
+            # Length too close to mean (uniform)
+            if abs(wlen - mean_len) < 3:
+                score += 0.2
+
+            # Passive voice indicator
+            lower_words = [w.lower() for w in words]
+            for j in range(len(lower_words) - 1):
+                if lower_words[j] in be_forms and j + 1 < len(lower_words):
+                    # crude VBN check: ends in "ed" or "en"
+                    nxt = lower_words[j + 1]
+                    if nxt.endswith("ed") or nxt.endswith("en"):
+                        score += 0.15
+                        break
+
+            # Very long without any punctuation variety
+            if wlen > 20 and "," not in sent and ";" not in sent:
+                score += 0.15
+
+            scored.append((i, score))
+
+        # Pick the worst offenders
+        scored.sort(key=lambda x: x[1], reverse=True)
+        to_fix = [(idx, sc) for idx, sc in scored[:max_fixes] if sc >= 0.3]
+
+        if not to_fix:
+            return text, 0
+
+        sys_prompt = textwrap.dedent(f"""\
+            Rewrite ONLY the single sentence provided.  Make it sound
+            authentically human.  Keep the same meaning.  Output ONLY
+            the rewritten sentence — no commentary.
+
+            Known issues with this text:\n{diagnosis}
+        """)
+
+        fixed_count = 0
+        for idx, _sc in to_fix:
+            original_sent = sentences[idx]
+            try:
+                rewritten = self._ollama_chat(
+                    model=model,
+                    system_prompt=sys_prompt,
+                    user_prompt=original_sent,
+                    timeout=60,
+                )
+                if rewritten and 3 < len(rewritten.split()) < len(original_sent.split()) * 2:
+                    sentences[idx] = rewritten.strip()
+                    fixed_count += 1
+            except Exception:
+                pass
+
+        return " ".join(sentences), fixed_count
+
+    # ------------------------------------------------------------------
+    # Full targeted rewrite (pass 2+)
+    # ------------------------------------------------------------------
+
+    def _targeted_rewrite(
+        self, text: str, model: str, diagnosis: str,
+        cfg: Optional[HumanizationConfig] = None,
+    ) -> str:
+        """Run a targeted full-text rewrite guided by detector diagnosis."""
+        cfg = cfg or HumanizationConfig()
+
+        sys_prompt = textwrap.dedent(f"""\
+            You are an AI-text remediation specialist.  The user will give you:
+            1. A DIAGNOSIS section listing the exact AI signals detected.
+            2. The TEXT to fix.
+
+            Your job: rewrite the text to specifically address EVERY flagged
+            issue in the diagnosis while keeping ALL facts intact.
+
+            Tone: {cfg.tone}.  Intensity: {cfg.intensity}.
+
+            Guidelines:
+            • If "low burstiness" → make sentence lengths dramatically uneven
+            • If "transition overuse" → remove or replace every transition starter
+            • If "low perplexity" → introduce surprises: unusual word choices,
+              rhetorical questions, parenthetical asides, sentence fragments
+            • If "uniformity" → break parallel structures, vary paragraph lengths
+            • If "vocabulary" → swap jargon for plain language
+            • If "passive voice" → convert to active voice
+
+            Output ONLY the rewritten text.  No commentary, labels, or meta-text.
+        """)
+
         user_msg = f"DIAGNOSIS:\n{diagnosis}\n\n---\n\nTEXT:\n{text}"
         try:
             result = self._ollama_chat(
                 model=model,
-                system_prompt=self._SYSTEM_PROMPT_P2,
+                system_prompt=sys_prompt,
                 user_prompt=user_msg,
-                timeout=max(180, len(text.split()) * 2),
+                timeout=max(180, len(text.split()) * 3),
             )
             return result
         except Exception as exc:
-            log.warning("Pass 2 LLM call failed: %s", exc)
+            log.warning("Targeted rewrite failed: %s", exc)
             return ""
 
     # ------------------------------------------------------------------
@@ -485,7 +875,7 @@ def _build_diagnosis(
             "words. Use more synonyms and varied phrasing."
         )
 
-    transition_freq = features.get("transition_word_freq", 0)
+    transition_freq = features.get("transition_word_ratio", 0)
     if transition_freq > 0.03:
         lines.append(
             f"• HIGH TRANSITION FREQUENCY ({transition_freq:.3f}): Too many "
@@ -499,8 +889,8 @@ def _build_diagnosis(
             "with the same words. Vary your openings."
         )
 
-    mean_sent_len = features.get("mean_sentence_length", 0)
-    std_sent_len = features.get("std_sentence_length", 0)
+    mean_sent_len = features.get("sentence_length_mean", 0)
+    std_sent_len = features.get("sentence_length_std", 0)
     if std_sent_len < 5:
         lines.append(
             f"• UNIFORM SENTENCE LENGTH (mean={mean_sent_len:.0f}, "
@@ -631,17 +1021,50 @@ def _add_parenthetical(sentence: str) -> str:
 
 
 def _vary_sentence_start(sentence: str) -> str:
-    """Rephrase the beginning of a sentence for variety."""
-    starters = [
-        "Interestingly, ", "In practice, ", "From this perspective, ",
-        "It turns out that ", "What stands out is that ",
-        "Looking at the data, ", "To put it simply, ",
-        "In many ways, ",
-    ]
-    # Only if sentence starts with a typical subject (The, This, These, It, A/An)
-    first_word = sentence.split()[0] if sentence.split() else ""
-    if first_word.lower() in {"the", "this", "these", "it", "a", "an", "such"}:
-        return random.choice(starters) + sentence[0].lower() + sentence[1:]
+    """Restructure the opening of a sentence for variety.
+
+    Instead of prepending clichéd transition starters (which AI detectors
+    flag), this applies genuine syntactic transformations:
+    - Fronting an adverbial clause
+    - Inverting subject/predicate order
+    - Starting with a gerund phrase
+    """
+    words = sentence.split()
+    if not words:
+        return sentence
+    first = words[0].lower()
+
+    # Only rewrite sentences that start with common determiners/pronouns
+    if first not in {"the", "this", "these", "it", "a", "an", "such"}:
+        return sentence
+
+    # Strategy 1: Move a prepositional/clause phrase to the front
+    # Look for  ", which" / ", where" / ", because" to invert
+    for marker in [", because ", ", since ", ", although "]:
+        if marker in sentence:
+            parts = sentence.split(marker, 1)
+            if len(parts) == 2 and len(parts[1].split()) > 3:
+                clause = parts[1].rstrip(".")
+                main = parts[0]
+                word = marker.strip(", ")
+                return f"{word.capitalize()} {clause}, {main[0].lower()}{main[1:]}."
+
+    # Strategy 2: For short sentences, just swap in a synonym for the determiner
+    swaps = {
+        "the": ["that particular", "one", "the very"],
+        "this": ["that", "one such"],
+        "these": ["such", "those"],
+        "it": ["that"],
+        "a": ["one", "a single"],
+        "an": ["one"],
+    }
+    if first in swaps and random.random() < 0.5:
+        replacement = random.choice(swaps[first])
+        if words[0][0].isupper():
+            replacement = replacement[0].upper() + replacement[1:]
+        words[0] = replacement
+        return " ".join(words)
+
     return sentence
 
 
@@ -712,13 +1135,33 @@ def _split_long_sentence(sentence: str) -> List[str]:
 
 
 def _perturb_lengths(sentences: List[str]) -> List[str]:
-    """Small random perturbations to sentence lengths for variability."""
+    """Small random perturbations to sentence lengths for variability.
+
+    Instead of adding clichéd "filler" transitions (which AI detectors flag),
+    this creates length variety by occasionally:
+    - Splitting a moderate sentence into two short ones
+    - Appending a short follow-up fragment
+    """
     result: List[str] = []
     for sent in sentences:
         words = sent.split()
-        # Occasionally add a mild interjection for short sentences
-        if len(words) < 6 and random.random() < 0.15:
-            fillers = ["Interestingly,", "In fact,", "Notably,", "Admittedly,"]
-            sent = f"{random.choice(fillers)} {sent[0].lower()}{sent[1:]}"
-        result.append(sent)
+        # Occasionally split a moderate sentence for burstiness
+        if 12 < len(words) < 20 and random.random() < 0.12:
+            mid = len(words) // 2
+            # Find a natural break (after a comma)
+            for offset in range(min(3, mid)):
+                for pos in [mid + offset, mid - offset]:
+                    if 0 < pos < len(words) and words[pos - 1].endswith(","):
+                        a = " ".join(words[:pos]).rstrip(",") + "."
+                        b = " ".join(words[pos:])
+                        b = b[0].upper() + b[1:] if b else b
+                        result.extend([a, b])
+                        break
+                else:
+                    continue
+                break
+            else:
+                result.append(sent)
+        else:
+            result.append(sent)
     return result

@@ -118,17 +118,73 @@ class FingerprintEngine:
         new_texts: List[str],
         profile_name: str = "default",
     ) -> StyleProfile:
-        """Add documents to an existing profile (or create if absent)."""
+        """Incrementally update an existing profile with new documents.
+
+        Uses running-mean / running-std formulas so previously uploaded
+        documents don't need to be re-processed.  If no profile exists yet,
+        falls back to ``create_profile``.
+        """
         existing = self.load_profile(profile_name)
         if existing is None:
             return self.create_profile(new_texts, profile_name)
 
-        # Re-compute from scratch (simple but correct)
-        # We'd need to store raw vectors for incremental update; for the
-        # expected low-volume usage this is fine.
-        combined = new_texts  # The profile is a statistical summary; caller
-        # should pass _all_ texts for a full rebuild, or we just merge stats.
-        return self.create_profile(combined, profile_name)
+        # Extract features from new texts
+        new_vectors: List[List[float]] = []
+        new_features: List[Dict[str, Any]] = []
+        for t in new_texts:
+            new_vectors.append(extract_feature_vector(t))
+            new_features.append(extract_features(t))
+
+        new_arr = np.array(new_vectors, dtype=np.float64)
+        new_mean = new_arr.mean(axis=0)
+        old_mean = np.array(existing.mean_vector, dtype=np.float64)
+        old_std = np.array(existing.std_vector, dtype=np.float64)
+
+        n_old = existing.num_documents
+        n_new = len(new_texts)
+        n_total = n_old + n_new
+
+        # Combined mean
+        combined_mean = (old_mean * n_old + new_mean * n_new) / n_total
+
+        # Combined std (via parallel variance formula)
+        if n_new > 1:
+            new_std = new_arr.std(axis=0)
+        else:
+            new_std = np.zeros_like(new_mean)
+        old_var = old_std ** 2
+        new_var = new_std ** 2
+        combined_var = (
+            (n_old * (old_var + (old_mean - combined_mean) ** 2)
+             + n_new * (new_var + (new_mean - combined_mean) ** 2))
+            / n_total
+        )
+        combined_std = np.sqrt(combined_var)
+
+        # Per-feature human-readable means
+        numeric_keys = sorted(existing.mean_features.keys())
+        mean_feats: Dict[str, float] = {}
+        for k in numeric_keys:
+            old_val = existing.mean_features.get(k, 0.0)
+            new_vals = [f[k] for f in new_features if k in f]
+            if new_vals:
+                new_val = float(np.mean(new_vals))
+                mean_feats[k] = round(
+                    (old_val * n_old + new_val * n_new) / n_total, 4
+                )
+            else:
+                mean_feats[k] = old_val
+
+        profile = StyleProfile(
+            profile_name=profile_name,
+            num_documents=n_total,
+            mean_vector=combined_mean.tolist(),
+            std_vector=combined_std.tolist(),
+            mean_features=mean_feats,
+            feature_names=numeric_keys,
+        )
+        self._save_profile(profile)
+        return profile
 
     # ------------------------------------------------------------------
     # Comparison
@@ -140,6 +196,10 @@ class FingerprintEngine:
         profile_name: str = "default",
     ) -> FingerprintResult:
         """Compare *text* against a stored style profile.
+
+        Uses **z-score normalisation** before cosine similarity so that
+        features with large absolute values (e.g. ``sentence_count``,
+        Yule's K) don't dominate the comparison.
 
         Returns
         -------
@@ -155,17 +215,38 @@ class FingerprintEngine:
                 profile_name=profile_name,
             )
 
-        doc_vec = np.array(extract_feature_vector(text)).reshape(1, -1)
-        profile_vec = np.array(profile.mean_vector).reshape(1, -1)
+        doc_vec = np.array(extract_feature_vector(text), dtype=np.float64)
+        profile_mean = np.array(profile.mean_vector, dtype=np.float64)
+        profile_std = np.array(profile.std_vector, dtype=np.float64)
 
         # Ensure vectors have compatible shapes
-        min_len = min(doc_vec.shape[1], profile_vec.shape[1])
-        sim = float(cosine_similarity(
-            doc_vec[:, :min_len], profile_vec[:, :min_len]
-        )[0, 0])
+        min_len = min(len(doc_vec), len(profile_mean))
+        doc_vec = doc_vec[:min_len]
+        profile_mean = profile_mean[:min_len]
+        profile_std = profile_std[:min_len] if len(profile_std) >= min_len else np.zeros(min_len)
+
+        # Z-score normalisation: centres each feature around the profile mean
+        # and scales by the profile std.  This prevents high-magnitude features
+        # like sentence_count or lexical_diversity from dominating cosine sim.
+        safe_std = np.where(profile_std > 1e-9, profile_std, 1.0)
+        doc_z = (doc_vec - profile_mean) / safe_std
+        profile_z = np.zeros_like(doc_z)  # profile mean maps to the origin
+
+        # Cosine similarity on normalised vectors
+        # When all deviations are zero doc_z is the zero vector → sim = 1.0
+        doc_norm = np.linalg.norm(doc_z)
+        if doc_norm < 1e-9:
+            sim = 1.0  # Identical to profile
+        else:
+            sim = float(cosine_similarity(
+                doc_z.reshape(1, -1), profile_z.reshape(1, -1)
+            )[0, 0])
+            # cosine_similarity returns -1..1; map to 0..1 for display
+            sim = (sim + 1.0) / 2.0
+
         sim = max(0.0, min(1.0, sim))
 
-        # Per-feature deviation
+        # Per-feature deviation (human-readable)
         doc_feats = extract_features(text)
         deviations: Dict[str, float] = {}
         for k, prof_val in profile.mean_features.items():

@@ -96,33 +96,79 @@ class PerplexityAnalyser:
         )
         self._model.eval()
 
-    def analyse(self, text: str, max_tokens: int = 1024) -> PerplexityResult:
-        """Return perplexity metrics for *text* (truncated to *max_tokens*)."""
+    def analyse(
+        self,
+        text: str,
+        window_size: int = 512,
+        stride: int = 256,
+    ) -> PerplexityResult:
+        """Return perplexity metrics using a **sliding-window** approach.
+
+        Instead of truncating the text to one 1024-token chunk (ignoring 95%
+        of longer documents), we slide a *window_size*-token window across the
+        full token sequence with *stride*-token steps and average the
+        per-window losses.
+
+        Parameters
+        ----------
+        text : str
+            The input text.
+        window_size : int
+            Tokens per window (default 512 — fits comfortably in DistilGPT-2's
+            1024-token context).
+        stride : int
+            Step size between windows (default 256 → 50 % overlap).
+        """
         import torch
 
         self._ensure_loaded()
 
+        # Tokenise the entire document (no truncation)
         encodings = self._tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=max_tokens
+            text, return_tensors="pt", truncation=False
         )
-        input_ids = encodings["input_ids"]
+        all_ids = encodings["input_ids"][0]  # shape: (total_tokens,)
+        total_tokens = all_ids.shape[0]
 
-        with torch.no_grad():
-            outputs = self._model(input_ids, labels=input_ids)
-            loss = outputs.loss.item()
+        # Short-text fast-path: fits in a single window
+        if total_tokens <= window_size:
+            input_ids = all_ids.unsqueeze(0)
+            with torch.no_grad():
+                outputs = self._model(input_ids, labels=input_ids)
+                loss = outputs.loss.item()
+            ppl = math.exp(loss)
+            normalised = self._normalise_ppl(ppl)
+            return PerplexityResult(
+                perplexity=round(ppl, 2),
+                mean_token_loss=round(loss, 4),
+                normalised_score=round(normalised, 4),
+                interpretation=self._interpret(normalised),
+            )
 
-        ppl = math.exp(loss)
-        # Map perplexity to a 0-1 "AI-ness" score.
-        # Typical AI text: PPL 15-40; human text: PPL 50-200+
+        # Sliding-window: collect per-window losses
+        window_losses: List[float] = []
+        for start in range(0, total_tokens, stride):
+            end = min(start + window_size, total_tokens)
+            if end - start < 32:
+                break  # skip tiny tail windows
+            chunk = all_ids[start:end].unsqueeze(0)
+            with torch.no_grad():
+                outputs = self._model(chunk, labels=chunk)
+                window_losses.append(outputs.loss.item())
+
+        if not window_losses:
+            # Fallback (shouldn't happen)
+            return PerplexityResult(interpretation="Insufficient text")
+
+        mean_loss = sum(window_losses) / len(window_losses)
+        ppl = math.exp(mean_loss)
         normalised = self._normalise_ppl(ppl)
-
-        interpretation = self._interpret(normalised)
 
         return PerplexityResult(
             perplexity=round(ppl, 2),
-            mean_token_loss=round(loss, 4),
+            mean_token_loss=round(mean_loss, 4),
             normalised_score=round(normalised, 4),
-            interpretation=interpretation,
+            interpretation=self._interpret(normalised),
         )
 
     # ---- helpers --
@@ -148,7 +194,7 @@ class PerplexityAnalyser:
 # ---------------------------------------------------------------------------
 
 class StyleAnalyser:
-    """Assess AI likelihood from stylometric features alone."""
+    """Assess AI likelihood from the *full set* of stylometric features."""
 
     def analyse(self, features: Dict[str, Any]) -> StyleResult:
         factors: List[str] = []
@@ -176,21 +222,60 @@ class StyleAnalyser:
             factors.append(f"Low hapax ratio ({hapax:.3f}) — high word reuse")
         vocab_score = min(vocab_score, 1.0)
 
-        # ---- Naturalness cues ----
+        # ---- Naturalness cues (expanded) ----
         naturalness = 0.5
         contraction = features.get("contraction_ratio", 0.0)
         starter_div = features.get("sentence_starter_diversity", 0.5)
         transition = features.get("transition_word_ratio", 0.0)
 
         if contraction > 0.005:
-            naturalness += 0.15
+            naturalness += 0.12
             factors.append("Contractions present — human cue")
         if starter_div > 0.7:
-            naturalness += 0.15
+            naturalness += 0.10
             factors.append(f"Higher sentence-starter diversity ({starter_div:.2f})")
         if transition > 0.02:
-            naturalness -= 0.15
+            naturalness -= 0.12
             factors.append(f"Heavy transition-word use ({transition:.3f}) — AI pattern")
+
+        # Passive voice — AI tends toward more passive constructions
+        passive = features.get("passive_voice_ratio", 0.0)
+        if passive > 0.25:
+            naturalness -= 0.08
+            factors.append(f"High passive voice ratio ({passive:.2f}) — common in AI text")
+        elif passive > 0.0:
+            naturalness += 0.05
+
+        # Flesch reading ease — AI usually targets mid-range (40-60)
+        flesch = features.get("flesch_reading_ease", 50.0)
+        if 35 < flesch < 65:
+            naturalness -= 0.06
+            factors.append(f"Flesch score ({flesch:.1f}) in narrow AI-typical band")
+        elif flesch > 70 or flesch < 25:
+            naturalness += 0.06
+            factors.append(f"Flesch score ({flesch:.1f}) outside typical AI range")
+
+        # Repeated n-gram phrases — AI avoids them; humans repeat
+        repeated = features.get("repeated_phrase_ratio", 0.0)
+        if repeated > 0.02:
+            naturalness += 0.06
+            factors.append(f"Repeated phrases ({repeated:.3f}) — natural repetition")
+        elif repeated < 0.005:
+            naturalness -= 0.04
+
+        # Average paragraph length — AI makes very even paragraphs
+        para_mean = features.get("paragraph_length_mean", 0)
+        para_std = features.get("paragraph_length_std", 0)
+        if para_mean > 0 and para_std / (para_mean + 1e-9) < 0.2:
+            naturalness -= 0.06
+            factors.append("Very uniform paragraph lengths — AI pattern")
+
+        # Conjunction ratio — AI overuses coordinating conjunctions
+        conj = features.get("conjunction_ratio", 0.0)
+        if conj > 0.04:
+            naturalness -= 0.05
+            factors.append(f"High conjunction ratio ({conj:.3f})")
+
         naturalness = max(0.0, min(naturalness, 1.0))
 
         return StyleResult(

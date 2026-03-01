@@ -100,6 +100,16 @@ class PlagiarismDetector:
         Returns
         -------
         PlagiarismResult
+
+        Notes
+        -----
+        **Semantic check** now delegates to ChromaDB's native vector search
+        (``query_similar``) instead of re-encoding the entire corpus on every
+        call.  This reduces runtime from O(N×M) to O(N log M).
+
+        **Scoring** uses a *coverage-based* scheme: the score reflects the
+        **fraction of input sentences that exceed the threshold**, not the
+        average similarity across all sentences (which dilutes real matches).
         """
         corpus_pairs = get_all_texts()  # list of (chunk_text, filename)
         if not corpus_pairs:
@@ -117,14 +127,14 @@ class PlagiarismDetector:
         if not input_sentences:
             return PlagiarismResult()
 
-        # 1. Lexical analysis
+        # 1. Lexical analysis (still uses TF-IDF — fast & complementary)
         lex_matches, lex_score = self._lexical_check(
             input_sentences, corpus_texts, corpus_files
         )
 
-        # 2. Semantic analysis
-        sem_matches, sem_score = self._semantic_check(
-            input_sentences, corpus_texts, corpus_files
+        # 2. Semantic analysis — ChromaDB-native vector search
+        sem_matches, sem_score = self._semantic_check_chromadb(
+            input_sentences
         )
 
         # Merge & deduplicate
@@ -152,7 +162,7 @@ class PlagiarismDetector:
         corpus_texts: List[str],
         corpus_files: List[str],
     ) -> Tuple[List[MatchSegment], float]:
-        """TF-IDF cosine similarity check."""
+        """TF-IDF cosine similarity check with **coverage-based** scoring."""
         all_docs = corpus_texts + input_sentences
         vectorizer = TfidfVectorizer(
             max_features=20_000,
@@ -171,14 +181,14 @@ class PlagiarismDetector:
         sim_matrix = cosine_similarity(input_vecs, corpus_vecs)
 
         matches: List[MatchSegment] = []
-        scores: List[float] = []
+        flagged_count = 0
 
         for i, sent in enumerate(input_sentences):
             best_j = int(np.argmax(sim_matrix[i]))
             best_sim = float(sim_matrix[i, best_j])
-            scores.append(best_sim)
 
             if best_sim >= self.lexical_threshold:
+                flagged_count += 1
                 matches.append(MatchSegment(
                     input_text=sent,
                     matched_text=corpus_texts[best_j][:300],
@@ -187,11 +197,61 @@ class PlagiarismDetector:
                     match_type="lexical",
                 ))
 
-        avg_score = float(np.mean(scores)) if scores else 0.0
-        return matches, avg_score
+        # Coverage-based: fraction of sentences that exceeded the threshold
+        coverage_score = flagged_count / len(input_sentences) if input_sentences else 0.0
+        return matches, coverage_score
 
     # ------------------------------------------------------------------
-    # Semantic: Sentence-Transformer embeddings
+    # Semantic: ChromaDB-native vector search (replaces brute-force)
+    # ------------------------------------------------------------------
+
+    def _semantic_check_chromadb(
+        self,
+        input_sentences: List[str],
+    ) -> Tuple[List[MatchSegment], float]:
+        """ChromaDB-native semantic similarity check.
+
+        Uses ``query_similar()`` per sentence, leveraging the pre-computed
+        embeddings stored in ChromaDB.  This is O(N log M) versus re-encoding
+        the full corpus on every call.
+        """
+        matches: List[MatchSegment] = []
+        flagged_count = 0
+
+        for sent in input_sentences:
+            # Skip very short sentences (< 5 words) — too noisy
+            if len(sent.split()) < 5:
+                continue
+
+            results = query_similar(sent, n_results=1)
+            if not results:
+                continue
+
+            top = results[0]
+            # ChromaDB returns L2 distance — convert to cosine similarity.
+            # For unit-normalised vectors: cos_sim = 1 - dist^2 / 2
+            # The default embedding function normalises, so this is safe.
+            distance = top.get("distance", 2.0)
+            similarity = max(0.0, 1.0 - distance / 2.0)
+
+            if similarity >= self.semantic_threshold:
+                flagged_count += 1
+                matches.append(MatchSegment(
+                    input_text=sent,
+                    matched_text=top.get("document", "")[:300],
+                    source_filename=top.get("filename", "unknown"),
+                    similarity=round(similarity, 4),
+                    match_type="semantic",
+                ))
+
+        n_checked = max(
+            1, sum(1 for s in input_sentences if len(s.split()) >= 5)
+        )
+        coverage_score = flagged_count / n_checked
+        return matches, coverage_score
+
+    # ------------------------------------------------------------------
+    # Legacy semantic: kept for offline/batch use if needed
     # ------------------------------------------------------------------
 
     def _semantic_check(

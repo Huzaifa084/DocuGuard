@@ -27,7 +27,7 @@ from db.chroma_client import get_collection, COLLECTION_CORPUS
 # Chunking parameters
 # ---------------------------------------------------------------------------
 CHUNK_WORD_SIZE: int = 400
-CHUNK_STRIDE: int = 50
+CHUNK_STRIDE: int = 200  # 50% overlap (was 50 → 87.5% overlap / 7× bloat)
 
 
 # ---------------------------------------------------------------------------
@@ -183,14 +183,13 @@ def delete_document(doc_id: str) -> bool:
     if collection.count() == 0:
         return False
 
-    raw = collection.get(include=["metadatas"])
+    # Use ChromaDB's `where` filter instead of fetching ALL metadatas
+    raw = collection.get(
+        where={"doc_id": doc_id},
+        include=[],  # we only need the IDs
+    )
 
-    chunk_ids = [
-        chunk_id
-        for chunk_id, meta in zip(raw["ids"], raw["metadatas"])
-        if meta.get("doc_id") == doc_id
-    ]
-
+    chunk_ids = raw["ids"]
     if not chunk_ids:
         return False
 

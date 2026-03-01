@@ -415,24 +415,113 @@ def _render_humanize_tab():
 
     # Show model selector when LLM strategy is chosen
     model_name = "mistral"
+    h_config = None
+
     if strategy == "llm":
-        model_name = st.selectbox(
-            "LLM Model",
-            ["mistral", "llama3"],
-            help="Select which Ollama model to use for rewriting.",
-        )
-        # Show Ollama connectivity status
         import requests as _req
+        from core.humanizer import HumanizationConfig, MAX_WORD_LIMIT
+
         _ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        # Dynamically fetch available models from Ollama
+        _available_models: list[str] = []
         try:
             _r = _req.get(f"{_ollama_url}/api/tags", timeout=3)
-            _models = [m["name"] for m in _r.json().get("models", [])]
-            if _models:
-                st.success(f"Ollama connected — available models: {', '.join(_models)}")
-            else:
-                st.warning("Ollama running but no models pulled. Run `docker exec ollama ollama pull mistral`")
+            _available_models = [
+                m["name"].split(":")[0]
+                for m in _r.json().get("models", [])
+            ]
+            _seen: set[str] = set()
+            _available_models = [
+                m for m in _available_models
+                if not (m in _seen or _seen.add(m))  # type: ignore[func-returns-value]
+            ]
         except Exception:
+            pass
+
+        if not _available_models:
+            _available_models = ["mistral", "llama3"]
             st.error(f"Cannot reach Ollama at {_ollama_url}. Is the container running?")
+        else:
+            st.success(f"Ollama connected — {len(_available_models)} model(s) available")
+
+        model_name = st.selectbox(
+            "LLM Model",
+            _available_models,
+            help="Select which Ollama model to use for rewriting.",
+        )
+
+        # ── User-controllable humanization settings ──────────────────
+        with st.expander("⚙️ Humanization Settings", expanded=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                tone = st.selectbox(
+                    "Writing Tone",
+                    ["academic", "casual", "professional", "creative"],
+                    index=0,
+                    help="Controls the voice and register of the rewritten text.",
+                )
+                intensity = st.select_slider(
+                    "Rewrite Intensity",
+                    options=["light", "balanced", "aggressive"],
+                    value="balanced",
+                    help=(
+                        "Light: minimal changes, preserve voice. "
+                        "Balanced: substantial rewrite. "
+                        "Aggressive: deep restructuring."
+                    ),
+                )
+            with col_b:
+                domain = st.text_input(
+                    "Subject Domain (optional)",
+                    placeholder="e.g. computer science, history, biology",
+                    help="Helps the LLM use domain-appropriate vocabulary.",
+                )
+                preserve_kw = st.text_input(
+                    "Preserve Keywords (optional)",
+                    placeholder="e.g. BERT, transformer, fine-tuning",
+                    help="Comma-separated terms that must appear verbatim.",
+                )
+
+            custom_instr = st.text_area(
+                "Custom Instructions (optional)",
+                placeholder="e.g. 'Keep the conclusion paragraph intact' or 'Use British English'",
+                height=68,
+                help="Free-form notes passed directly to the LLM.",
+            )
+
+            col_c, col_d = st.columns(2)
+            with col_c:
+                target_prob = st.slider(
+                    "Target AI Probability",
+                    min_value=0.10, max_value=0.50, value=0.30, step=0.05,
+                    help="Pipeline stops iterating once AI prob drops below this.",
+                )
+            with col_d:
+                max_passes = st.slider(
+                    "Max LLM Passes",
+                    min_value=1, max_value=3, value=3,
+                    help="More passes = better results but longer processing time.",
+                )
+
+        # Show word-count info
+        _wc = len(st.session_state["last_doc"].cleaned_text.split())
+        if _wc > MAX_WORD_LIMIT:
+            st.warning(
+                f"Input is {_wc:,} words — only the first {MAX_WORD_LIMIT:,} "
+                f"words will be processed; the rest is appended unchanged."
+            )
+        else:
+            st.info(f"Input: {_wc:,} words (limit: {MAX_WORD_LIMIT:,})")
+
+        h_config = HumanizationConfig(
+            tone=tone,
+            intensity=intensity,
+            domain=domain.strip(),
+            preserve_keywords=preserve_kw.strip(),
+            custom_instructions=custom_instr.strip(),
+            target_ai_prob=target_prob,
+            max_passes=max_passes,
+        )
 
     if st.button("🔄 Humanize & Re-evaluate", type="primary"):
         doc = st.session_state["last_doc"]
@@ -454,6 +543,7 @@ def _render_humanize_tab():
                 strategy=strategy,
                 model=model_name,
                 progress_cb=_progress_cb,
+                config=h_config,
             )
             progress_bar.progress(1.0, text="✅ Humanization complete")
             status_text.empty()
@@ -480,11 +570,18 @@ def _render_humanize_tab():
         ai_after = st.session_state["last_humanize_ai_after"]
 
         st.divider()
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("AI Prob. (Before)", f"{ai_before.ai_probability:.1%}")
         c2.metric("AI Prob. (After)", f"{ai_after.ai_probability:.1%}")
         delta = ai_before.ai_probability - ai_after.ai_probability
         c3.metric("Improvement", f"{delta:+.1%}")
+        c4.metric("LLM Passes", h_result.passes_used if hasattr(h_result, "passes_used") else "—")
+
+        if hasattr(h_result, "word_count_original") and h_result.word_count_original:
+            st.caption(
+                f"Words: {h_result.word_count_original:,} → "
+                f"{h_result.word_count_humanized:,}"
+            )
 
         st.markdown("**Pipeline stages:**")
         for ch in h_result.changes_summary:
