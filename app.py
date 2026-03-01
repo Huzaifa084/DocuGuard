@@ -41,7 +41,6 @@ def _load_plagiarism_detector():
     return PlagiarismDetector()
 
 
-@st.cache_resource(show_spinner=False)
 def _load_humanizer():
     from core.humanizer import Humanizer
     return Humanizer()
@@ -441,17 +440,45 @@ def _render_humanize_tab():
 
         humanizer = _load_humanizer()
 
-        with st.spinner("Humanizing text …"):
-            h_result = humanizer.humanize(doc.cleaned_text, strategy=strategy, model=model_name)
+        # --- Progress UI for LLM pipeline ---------------------------------
+        if strategy == "llm":
+            progress_bar = st.progress(0.0, text="Initialising LLM pipeline …")
+            status_text = st.empty()
 
-        with st.spinner("Re-evaluating humanized text …"):
+            def _progress_cb(stage: str, pct: float):
+                progress_bar.progress(min(pct, 1.0), text=stage)
+                status_text.caption(stage)
+
+            h_result = humanizer.humanize(
+                doc.cleaned_text,
+                strategy=strategy,
+                model=model_name,
+                progress_cb=_progress_cb,
+            )
+            progress_bar.progress(1.0, text="✅ Humanization complete")
+            status_text.empty()
+        else:
+            with st.spinner("Humanizing text …"):
+                h_result = humanizer.humanize(doc.cleaned_text, strategy=strategy, model=model_name)
+
+        with st.spinner("Final AI evaluation …"):
             detector = _load_ai_detector()
             ai_after = detector.detect(h_result.humanized_text)
 
         h_result.ai_prob_before = ai_before.ai_probability
         h_result.ai_prob_after = ai_after.ai_probability
 
-        # Display comparison
+        # Persist humanization results in session state
+        st.session_state["last_humanize_result"] = h_result
+        st.session_state["last_humanize_ai_before"] = ai_before
+        st.session_state["last_humanize_ai_after"] = ai_after
+
+    # --- Always render results from session state -------------------------
+    if "last_humanize_result" in st.session_state:
+        h_result = st.session_state["last_humanize_result"]
+        ai_before = st.session_state["last_humanize_ai_before"]
+        ai_after = st.session_state["last_humanize_ai_after"]
+
         st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("AI Prob. (Before)", f"{ai_before.ai_probability:.1%}")
@@ -459,12 +486,20 @@ def _render_humanize_tab():
         delta = ai_before.ai_probability - ai_after.ai_probability
         c3.metric("Improvement", f"{delta:+.1%}")
 
-        st.markdown("**Changes made:**")
+        st.markdown("**Pipeline stages:**")
         for ch in h_result.changes_summary:
             st.markdown(f"- {ch}")
 
-        with st.expander("View Humanized Text"):
+        with st.expander("View Humanized Text", expanded=True):
             st.text_area("Humanized output", h_result.humanized_text, height=300)
+
+        # Copy button
+        st.download_button(
+            "📋 Download Humanized Text",
+            data=h_result.humanized_text,
+            file_name="humanized_output.txt",
+            mime="text/plain",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

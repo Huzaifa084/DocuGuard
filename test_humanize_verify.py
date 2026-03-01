@@ -1,5 +1,5 @@
-"""Verify humanization is actually changing text meaningfully."""
-import sys, os
+"""Verify the full multi-pass LLM humanization pipeline."""
+import sys, os, time
 sys.path.insert(0, ".")
 os.environ["OLLAMA_URL"] = "http://localhost:11434"
 
@@ -23,6 +23,7 @@ ai_before = det.detect(AI_TEXT)
 print(f"\nAI Probability (BEFORE): {ai_before.ai_probability:.2%}")
 print(f"Confidence: {ai_before.confidence}")
 print(f"Perplexity: {ai_before.perplexity_result.perplexity:.2f}")
+print(f"Burstiness: {ai_before.features.get('burstiness', 'N/A')}")
 
 # --- Rule-based humanization ---
 print("\n" + "=" * 70)
@@ -36,37 +37,29 @@ ai_after_rule = det.detect(h_rule.humanized_text)
 print(f"AI Probability (AFTER rule-based): {ai_after_rule.ai_probability:.2%}")
 print(f"Delta: {ai_before.ai_probability - ai_after_rule.ai_probability:+.2%}")
 
-# --- LLM humanization (Mistral) ---
+# --- LLM humanization (multi-pass pipeline) ---
 print("\n" + "=" * 70)
-print("LLM HUMANIZATION (MISTRAL)")
+print("LLM HUMANIZATION — MULTI-PASS PIPELINE (MISTRAL)")
 print("=" * 70)
-h_llm = h.humanize(AI_TEXT, strategy="llm", model="mistral")
-print(h_llm.humanized_text)
-print(f"\nStrategy used: {h_llm.strategy}")
-print(f"Changes: {h_llm.changes_summary}")
+
+def progress(stage, pct):
+    print(f"  [{pct:5.0%}] {stage}")
+
+t0 = time.time()
+h_llm = h.humanize(AI_TEXT, strategy="llm", model="mistral", progress_cb=progress)
+elapsed = time.time() - t0
+
+print(f"\n--- Pipeline completed in {elapsed:.1f}s ---")
+print(f"\nHumanized text:\n{h_llm.humanized_text}")
+print(f"\nStrategy: {h_llm.strategy}")
+print(f"Pipeline stages:")
+for ch in h_llm.changes_summary:
+    print(f"  • {ch}")
 
 ai_after_llm = det.detect(h_llm.humanized_text)
-print(f"AI Probability (AFTER Mistral): {ai_after_llm.ai_probability:.2%}")
+print(f"\nAI Probability (AFTER LLM pipeline): {ai_after_llm.ai_probability:.2%}")
+print(f"Burstiness (AFTER): {ai_after_llm.features.get('burstiness', 'N/A')}")
 print(f"Delta: {ai_before.ai_probability - ai_after_llm.ai_probability:+.2%}")
-
-# --- Side-by-side sentence comparison ---
-print("\n" + "=" * 70)
-print("SENTENCE-BY-SENTENCE COMPARISON (Original vs Mistral)")
-print("=" * 70)
-from utils.text_utils import split_sentences
-orig_sents = split_sentences(AI_TEXT)
-llm_sents = split_sentences(h_llm.humanized_text)
-
-for i, s in enumerate(orig_sents):
-    print(f"\n[Original {i+1}]: {s.strip()}")
-    if i < len(llm_sents):
-        print(f"[Mistral  {i+1}]: {llm_sents[i].strip()}")
-    else:
-        print(f"[Mistral  {i+1}]: (no corresponding sentence)")
-
-if len(llm_sents) > len(orig_sents):
-    for i in range(len(orig_sents), len(llm_sents)):
-        print(f"\n[Mistral  {i+1}] (extra): {llm_sents[i].strip()}")
 
 # --- Summary ---
 print("\n" + "=" * 70)
@@ -74,8 +67,6 @@ print("SUMMARY")
 print("=" * 70)
 print(f"  Original AI prob:     {ai_before.ai_probability:.2%}")
 print(f"  After rule-based:     {ai_after_rule.ai_probability:.2%}  ({ai_before.ai_probability - ai_after_rule.ai_probability:+.2%})")
-print(f"  After Mistral LLM:    {ai_after_llm.ai_probability:.2%}  ({ai_before.ai_probability - ai_after_llm.ai_probability:+.2%})")
-print(f"\n  Rule-based changed:   {len(h_rule.changes_summary)} transforms")
-print(f"  LLM strategy used:    {h_llm.strategy}")
-same_text = AI_TEXT.strip() == h_llm.humanized_text.strip()
-print(f"  Text actually changed: {'NO (PROBLEM!)' if same_text else 'YES'}")
+print(f"  After LLM pipeline:   {ai_after_llm.ai_probability:.2%}  ({ai_before.ai_probability - ai_after_llm.ai_probability:+.2%})")
+print(f"\n  LLM pipeline time:    {elapsed:.1f}s")
+print(f"  Text actually changed: {'YES' if AI_TEXT.strip() != h_llm.humanized_text.strip() else 'NO (PROBLEM!)'}")
