@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  docuguard-app:
+    build: .
+    container_name: docuguard-app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./corpus:/app/corpus
+      - ./chroma_db:/app/chroma_db
+      - ./fingerprints:/app/fingerprints
+      - ./reports:/app/reports
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+  ollama-models:

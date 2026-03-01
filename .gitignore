@@ -1,0 +1,46 @@
+# Python bytecode and distribution artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Runtime data directories
+chroma_db/
+corpus/
+fingerprints/
+reports/
+
+# Large model binary files
+*.pt
+*.bin
+*.safetensors
+
+# Environment secrets
+.env
+
+# IDE and editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker artifacts
+.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+tmpclaude**
+nul

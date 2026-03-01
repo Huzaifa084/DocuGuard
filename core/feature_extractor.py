@@ -1,0 +1,302 @@
+"""
+feature_extractor.py
+--------------------
+Stylometric and statistical feature extraction for DocuGuard+.
+
+Produces a dictionary of measurable "fingerprint" values that feed into the
+AI Detection Engine and the Writing Fingerprint Comparison module.
+
+Feature groups:
+  • Sentence metrics  – length mean / variance / burstiness
+  • Vocabulary        – Type-Token Ratio (TTR), hapax ratio, lexical diversity
+  • Grammar patterns  – passive voice ratio, stopword frequency
+  • Style indicators  – punctuation patterns, repetition frequency
+  • Readability       – Flesch Reading Ease
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from collections import Counter
+from typing import Any, Dict, List
+
+import nltk
+from nltk.corpus import stopwords
+
+from utils.text_utils import (
+    count_syllables,
+    flesch_reading_ease,
+    split_sentences,
+    tokenize_words,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+_STOPWORDS: set[str] = set(stopwords.words("english"))
+
+_TRANSITION_WORDS: set[str] = {
+    "however", "therefore", "moreover", "furthermore", "additionally",
+    "consequently", "nevertheless", "meanwhile", "nonetheless",
+    "subsequently", "accordingly", "hence", "thus", "indeed",
+    "alternatively", "conversely", "likewise", "similarly",
+    "specifically", "notably", "importantly", "significantly",
+    "ultimately", "essentially", "overall", "in conclusion",
+}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def extract_features(text: str) -> Dict[str, Any]:
+    """Return a flat dictionary of stylometric / statistical features.
+
+    Parameters
+    ----------
+    text:
+        Cleaned, full-document text.
+
+    Returns
+    -------
+    dict
+        Keys are human-readable feature names; values are floats / ints.
+    """
+    sentences = split_sentences(text)
+    words = tokenize_words(text)
+
+    features: Dict[str, Any] = {}
+
+    # ---- Sentence metrics ------------------------------------------------
+    features.update(_sentence_metrics(sentences, words))
+
+    # ---- Vocabulary metrics ----------------------------------------------
+    features.update(_vocabulary_metrics(words))
+
+    # ---- Grammar patterns --------------------------------------------------
+    features.update(_grammar_patterns(text, words))
+
+    # ---- Style indicators --------------------------------------------------
+    features.update(_style_indicators(text, sentences, words))
+
+    # ---- Readability -------------------------------------------------------
+    features["flesch_reading_ease"] = flesch_reading_ease(text)
+
+    return features
+
+
+def extract_feature_vector(text: str) -> List[float]:
+    """Return ordered numeric feature values suitable for ML input.
+
+    Guarantees a deterministic key order so the vector is reproducible.
+    """
+    feats = extract_features(text)
+    # Sort by key for deterministic ordering
+    return [float(v) for _, v in sorted(feats.items()) if isinstance(v, (int, float))]
+
+
+def feature_names() -> List[str]:
+    """Return the sorted list of numeric feature names (matches vector order)."""
+    # Build a dummy feature dict to discover keys
+    dummy = extract_features("The quick brown fox jumps over the lazy dog. " * 5)
+    return sorted(k for k, v in dummy.items() if isinstance(v, (int, float)))
+
+
+# ---------------------------------------------------------------------------
+# Sentence metrics
+# ---------------------------------------------------------------------------
+
+def _sentence_metrics(sentences: List[str], words: List[str]) -> Dict[str, float]:
+    if not sentences:
+        return {
+            "sentence_count": 0,
+            "sentence_length_mean": 0.0,
+            "sentence_length_variance": 0.0,
+            "sentence_length_std": 0.0,
+            "burstiness": 0.0,
+        }
+
+    lengths = [len(s.split()) for s in sentences]
+    n = len(lengths)
+    mean = sum(lengths) / n
+    variance = sum((l - mean) ** 2 for l in lengths) / n if n > 1 else 0.0
+    std = math.sqrt(variance)
+
+    # Burstiness: coefficient of variation (std / mean). High → human-like.
+    burstiness = std / mean if mean > 0 else 0.0
+
+    return {
+        "sentence_count": n,
+        "sentence_length_mean": round(mean, 3),
+        "sentence_length_variance": round(variance, 3),
+        "sentence_length_std": round(std, 3),
+        "burstiness": round(burstiness, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary metrics
+# ---------------------------------------------------------------------------
+
+def _vocabulary_metrics(words: List[str]) -> Dict[str, float]:
+    if not words:
+        return {
+            "type_token_ratio": 0.0,
+            "hapax_ratio": 0.0,
+            "lexical_diversity": 0.0,
+            "avg_word_length": 0.0,
+            "long_word_ratio": 0.0,
+        }
+
+    freq = Counter(words)
+    types = len(freq)
+    tokens = len(words)
+    hapax = sum(1 for c in freq.values() if c == 1)
+
+    ttr = types / tokens
+    hapax_ratio = hapax / tokens
+    # Yule's K approximation for lexical diversity
+    lexical_diversity = _yules_k(freq, tokens)
+    avg_word_length = sum(len(w) for w in words) / tokens
+    long_word_ratio = sum(1 for w in words if len(w) > 6) / tokens
+
+    return {
+        "type_token_ratio": round(ttr, 4),
+        "hapax_ratio": round(hapax_ratio, 4),
+        "lexical_diversity": round(lexical_diversity, 4),
+        "avg_word_length": round(avg_word_length, 3),
+        "long_word_ratio": round(long_word_ratio, 4),
+    }
+
+
+def _yules_k(freq: Counter, n: int) -> float:
+    """Yule's K — a measure of vocabulary richness.
+
+    Lower values indicate *more* diverse vocabulary.
+    """
+    if n == 0:
+        return 0.0
+    spectrum = Counter(freq.values())
+    m2 = sum(i * i * vi for i, vi in spectrum.items())
+    k = 10000 * (m2 - n) / (n * n) if n > 1 else 0.0
+    return k
+
+
+# ---------------------------------------------------------------------------
+# Grammar patterns
+# ---------------------------------------------------------------------------
+
+def _grammar_patterns(text: str, words: List[str]) -> Dict[str, float]:
+    if not words:
+        return {
+            "passive_voice_ratio": 0.0,
+            "stopword_ratio": 0.0,
+            "modal_verb_ratio": 0.0,
+        }
+
+    # ---- Passive voice detection (heuristic: "be" form + past participle) --
+    passive_count = _count_passive_voice(text)
+    sentences = split_sentences(text)
+    passive_ratio = passive_count / len(sentences) if sentences else 0.0
+
+    # ---- Stopword frequency --
+    sw_count = sum(1 for w in words if w in _STOPWORDS)
+    stopword_ratio = sw_count / len(words)
+
+    # ---- Modal verbs --
+    modals = {"can", "could", "may", "might", "must", "shall", "should",
+              "will", "would"}
+    modal_count = sum(1 for w in words if w in modals)
+    modal_ratio = modal_count / len(words)
+
+    return {
+        "passive_voice_ratio": round(passive_ratio, 4),
+        "stopword_ratio": round(stopword_ratio, 4),
+        "modal_verb_ratio": round(modal_ratio, 4),
+    }
+
+
+def _count_passive_voice(text: str) -> int:
+    """Heuristic passive voice counter via POS tagging."""
+    sentences = split_sentences(text)
+    passive_count = 0
+    be_forms = {"am", "is", "are", "was", "were", "be", "been", "being"}
+
+    for sent in sentences:
+        try:
+            tokens = nltk.word_tokenize(sent)
+            tagged = nltk.pos_tag(tokens)
+        except Exception:
+            continue
+
+        for i in range(len(tagged) - 1):
+            word, tag = tagged[i]
+            next_word, next_tag = tagged[i + 1]
+            # "be" form followed by past participle (VBN)
+            if word.lower() in be_forms and next_tag == "VBN":
+                passive_count += 1
+                break  # count once per sentence
+
+    return passive_count
+
+
+# ---------------------------------------------------------------------------
+# Style indicators
+# ---------------------------------------------------------------------------
+
+def _style_indicators(
+    text: str, sentences: List[str], words: List[str]
+) -> Dict[str, float]:
+    if not words:
+        return {
+            "comma_ratio": 0.0,
+            "semicolon_ratio": 0.0,
+            "question_ratio": 0.0,
+            "exclamation_ratio": 0.0,
+            "transition_word_ratio": 0.0,
+            "repeated_phrase_ratio": 0.0,
+            "contraction_ratio": 0.0,
+            "sentence_starter_diversity": 0.0,
+        }
+
+    n_words = len(words)
+    n_sents = max(len(sentences), 1)
+
+    # ---- Punctuation ratios (per word) --
+    comma_ratio = text.count(",") / n_words
+    semicolon_ratio = text.count(";") / n_words
+    question_ratio = text.count("?") / n_sents
+    exclamation_ratio = text.count("!") / n_sents
+
+    # ---- Transition word frequency --
+    transition_count = sum(1 for w in words if w in _TRANSITION_WORDS)
+    transition_ratio = transition_count / n_words
+
+    # ---- Repeated n-gram ratio (bigrams appearing > 2 times) --
+    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+    bigram_freq = Counter(bigrams)
+    repeated = sum(c for c in bigram_freq.values() if c > 2)
+    repeated_phrase_ratio = repeated / max(len(bigrams), 1)
+
+    # ---- Contractions (hint of informal / human writing) --
+    contraction_count = len(re.findall(
+        r"\b\w+n't\b|\b\w+'(?:re|ve|ll|s|d|m)\b", text, re.IGNORECASE
+    ))
+    contraction_ratio = contraction_count / n_words
+
+    # ---- Sentence starter diversity --
+    starters = [s.split()[0].lower() for s in sentences if s.split()]
+    unique_starters = len(set(starters))
+    starter_diversity = unique_starters / len(starters) if starters else 0.0
+
+    return {
+        "comma_ratio": round(comma_ratio, 4),
+        "semicolon_ratio": round(semicolon_ratio, 4),
+        "question_ratio": round(question_ratio, 4),
+        "exclamation_ratio": round(exclamation_ratio, 4),
+        "transition_word_ratio": round(transition_ratio, 4),
+        "repeated_phrase_ratio": round(repeated_phrase_ratio, 4),
+        "contraction_ratio": round(contraction_ratio, 4),
+        "sentence_starter_diversity": round(starter_diversity, 4),
+    }
