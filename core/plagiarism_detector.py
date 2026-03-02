@@ -232,7 +232,7 @@ class PlagiarismDetector:
             # For unit-normalised vectors: cos_sim = 1 - dist^2 / 2
             # The default embedding function normalises, so this is safe.
             distance = top.get("distance", 2.0)
-            similarity = max(0.0, 1.0 - distance / 2.0)
+            similarity = max(0.0, 1.0 - (distance ** 2) / 2.0)
 
             if similarity >= self.semantic_threshold:
                 flagged_count += 1

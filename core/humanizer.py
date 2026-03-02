@@ -91,6 +91,7 @@ class HumanizationResult:
     word_count_original: int = 0
     word_count_humanized: int = 0
     passes_used: int = 0
+    elapsed_seconds: float = 0.0        # Total processing time
 
 
 # Type alias for an optional progress callback (stage_name, pct)
@@ -367,6 +368,14 @@ class Humanizer:
                     changes.append(f"Pass {pass_num}: full targeted rewrite")
 
             passes_used += 1
+        else:
+            # Loop completed without meeting target
+            final_ai_prob, _, _ = self._run_detection_gate(draft)
+            if final_ai_prob >= target_prob:
+                changes.append(
+                    f"Max passes ({max_passes}) reached. Final AI prob: {final_ai_prob:.0%} "
+                    f"(target was {target_prob:.0%})"
+                )
 
         # ── Final rule-based polish ─────────────────────────────────────
         _cb("Final rule-based polish …", 0.90)
@@ -588,10 +597,11 @@ class Humanizer:
                 rewritten.append(para)
                 continue
 
-            # Build context window: previous + next paragraph (read-only)
+            # Build context window: previous (REWRITTEN) + next (original) paragraph
             ctx_parts: List[str] = []
             if idx > 0:
-                ctx_parts.append(f"[PREVIOUS PARAGRAPH — for context only, do NOT rewrite]\n{paragraphs[idx - 1]}")
+                # Use the ALREADY REWRITTEN previous paragraph for coherence
+                ctx_parts.append(f"[PREVIOUS PARAGRAPH — for context only, do NOT rewrite]\n{rewritten[idx - 1]}")
             ctx_parts.append(f"[REWRITE THIS PARAGRAPH]\n{para}")
             if idx < n - 1:
                 ctx_parts.append(f"[NEXT PARAGRAPH — for context only, do NOT rewrite]\n{paragraphs[idx + 1]}")
@@ -605,14 +615,27 @@ class Humanizer:
                     user_prompt=user_msg,
                     timeout=max(120, len(para.split()) * 3),
                 )
-                # Validate output
-                if result and len(result.split()) > len(para.split()) * 0.3:
-                    # Strip any accidentally included context paragraphs
-                    result = self._strip_context_leakage(result, paragraphs, idx)
-                    rewritten.append(result)
-                else:
-                    log.warning("Paragraph %d: LLM output too short, keeping original", idx)
+                # Validate output: check length bounds and meta-commentary
+                result_words = len(result.split()) if result else 0
+                para_words = len(para.split())
+                if not result or result_words < para_words * 0.3:
+                    log.warning("Paragraph %d: LLM output too short (%d vs %d), keeping original", idx, result_words, para_words)
                     rewritten.append(para)
+                elif result_words > para_words * 3:
+                    log.warning("Paragraph %d: LLM output too long (%d vs %d), keeping original", idx, result_words, para_words)
+                    rewritten.append(para)
+                else:
+                    # Strip meta-commentary prefixes
+                    result_lower = result.lower().lstrip()
+                    if result_lower.startswith(("here", "sure", "certainly", "i've", "i have", "the rewritten")):
+                        # Find first newline or period and skip the preamble
+                        for sep in ("\n\n", "\n", ". "):
+                            if sep in result:
+                                result = result.split(sep, 1)[1]
+                                break
+                    # Strip any accidentally included context paragraphs
+                    result = self._strip_context_leakage(result, paragraphs, rewritten, idx)
+                    rewritten.append(result)
             except Exception as exc:
                 log.warning("Paragraph %d rewrite failed: %s", idx, exc)
                 rewritten.append(para)
@@ -621,18 +644,30 @@ class Humanizer:
 
     @staticmethod
     def _strip_context_leakage(
-        result: str, paragraphs: List[str], current_idx: int,
+        result: str, paragraphs: List[str], rewritten: List[str], current_idx: int,
     ) -> str:
         """Remove accidentally repeated context paragraphs from LLM output."""
+        # Remove marker lines
         lines = result.strip().split("\n")
-        # Remove any lines that look like our context markers
         filtered = [
             ln for ln in lines
             if not ln.strip().startswith("[PREVIOUS PARAGRAPH")
             and not ln.strip().startswith("[NEXT PARAGRAPH")
             and not ln.strip().startswith("[REWRITE THIS")
         ]
-        return "\n".join(filtered).strip()
+        result = "\n".join(filtered).strip()
+
+        # Remove actual context paragraph content if accidentally included
+        if current_idx > 0 and len(rewritten) > current_idx - 1:
+            prev_para = rewritten[current_idx - 1]
+            if prev_para in result:
+                result = result.replace(prev_para, "").strip()
+        if current_idx < len(paragraphs) - 1:
+            next_para = paragraphs[current_idx + 1]
+            if next_para in result:
+                result = result.replace(next_para, "").strip()
+
+        return result
 
     # ------------------------------------------------------------------
     # AI-detection gate helper
@@ -667,16 +702,28 @@ class Humanizer:
         Uses a lightweight per-sentence AI probability estimate (perplexity +
         feature extraction on the sentence in context) to find the worst
         offenders, then rewrites them one by one.
+
+        Preserves original paragraph structure by tracking paragraph boundaries.
         """
-        sentences = split_sentences(text)
-        if len(sentences) < 3:
+        import time
+
+        # Split into paragraphs first to preserve structure
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        if not paragraphs:
+            return text, 0
+
+        # Build a flat list of (paragraph_idx, sentence) tuples
+        all_sentences: List[tuple[int, str]] = []
+        for para_idx, para in enumerate(paragraphs):
+            para_sents = split_sentences(para)
+            for sent in para_sents:
+                all_sentences.append((para_idx, sent))
+
+        if len(all_sentences) < 3:
             return text, 0
 
         # Score each sentence by a quick heuristic:
-        # - starts with a flagged transition word
-        # - very close in length to the mean (low variance contribution)
-        # - uses passive voice
-        mean_len = sum(len(s.split()) for s in sentences) / len(sentences)
+        mean_len = sum(len(s.split()) for _, s in all_sentences) / len(all_sentences)
         transition_starters = {
             "furthermore", "moreover", "additionally", "consequently",
             "nevertheless", "subsequently", "however", "therefore",
@@ -685,8 +732,8 @@ class Humanizer:
         }
         be_forms = {"am", "is", "are", "was", "were", "been", "being"}
 
-        scored: List[tuple[int, float]] = []  # (index, ai_score)
-        for i, sent in enumerate(sentences):
+        scored: List[tuple[int, float]] = []  # (flat_index, ai_score)
+        for i, (_, sent) in enumerate(all_sentences):
             score = 0.0
             words = sent.split()
             wlen = len(words)
@@ -706,7 +753,6 @@ class Humanizer:
             lower_words = [w.lower() for w in words]
             for j in range(len(lower_words) - 1):
                 if lower_words[j] in be_forms and j + 1 < len(lower_words):
-                    # crude VBN check: ends in "ed" or "en"
                     nxt = lower_words[j + 1]
                     if nxt.endswith("ed") or nxt.endswith("en"):
                         score += 0.15
@@ -734,22 +780,34 @@ class Humanizer:
         """)
 
         fixed_count = 0
-        for idx, _sc in to_fix:
-            original_sent = sentences[idx]
-            try:
-                rewritten = self._ollama_chat(
-                    model=model,
-                    system_prompt=sys_prompt,
-                    user_prompt=original_sent,
-                    timeout=60,
-                )
-                if rewritten and 3 < len(rewritten.split()) < len(original_sent.split()) * 2:
-                    sentences[idx] = rewritten.strip()
-                    fixed_count += 1
-            except Exception:
-                pass
+        for flat_idx, _sc in to_fix:
+            para_idx, original_sent = all_sentences[flat_idx]
+            # Retry up to 2 times on failure
+            for attempt in range(2):
+                try:
+                    rewritten = self._ollama_chat(
+                        model=model,
+                        system_prompt=sys_prompt,
+                        user_prompt=original_sent,
+                        timeout=60,
+                    )
+                    if rewritten and 3 < len(rewritten.split()) < len(original_sent.split()) * 2:
+                        all_sentences[flat_idx] = (para_idx, rewritten.strip())
+                        fixed_count += 1
+                        break
+                except Exception as exc:
+                    if attempt < 1:
+                        time.sleep(1)
+                        continue
+                    log.warning("Sentence fix failed after retries: %s", exc)
 
-        return " ".join(sentences), fixed_count
+        # Reconstruct text preserving paragraph structure
+        rebuilt_paragraphs: List[List[str]] = [[] for _ in paragraphs]
+        for para_idx, sent in all_sentences:
+            rebuilt_paragraphs[para_idx].append(sent)
+
+        result_paragraphs = [" ".join(sents) for sents in rebuilt_paragraphs]
+        return "\n\n".join(result_paragraphs), fixed_count
 
     # ------------------------------------------------------------------
     # Full targeted rewrite (pass 2+)

@@ -156,20 +156,72 @@ class PerplexityAnalyser:
                 interpretation=self._interpret(normalised),
             )
 
-        # Sliding-window: collect per-window losses
-        window_losses: List[float] = []
+        # Sliding-window: batch multiple windows for efficiency
+        # Collect window start/end positions
+        windows: List[tuple[int, int]] = []
         for start in range(0, total_tokens, stride):
             end = min(start + window_size, total_tokens)
             if end - start < 32:
                 break  # skip tiny tail windows
-            chunk = all_ids[start:end].unsqueeze(0)
-            with torch.no_grad():
-                outputs = self._model(chunk, labels=chunk)
-                window_losses.append(outputs.loss.item())
+            windows.append((start, end))
 
-        if not window_losses:
-            # Fallback (shouldn't happen)
+        if not windows:
             return PerplexityResult(interpretation="Insufficient text")
+
+        # Batch inference: process windows in batches for GPU efficiency
+        BATCH_SIZE = 8  # Process 8 windows at a time
+        window_losses: List[float] = []
+        
+        for batch_start in range(0, len(windows), BATCH_SIZE):
+            batch_windows = windows[batch_start:batch_start + BATCH_SIZE]
+            
+            # All windows in this batch should be padded to max length
+            max_len = max(e - s for s, e in batch_windows)
+            batch_chunks = []
+            attention_masks = []
+            
+            for start, end in batch_windows:
+                chunk = all_ids[start:end]
+                chunk_len = len(chunk)
+                # Pad shorter chunks
+                if chunk_len < max_len:
+                    padding = torch.zeros(max_len - chunk_len, dtype=chunk.dtype)
+                    chunk = torch.cat([chunk, padding])
+                    mask = torch.cat([
+                        torch.ones(chunk_len, dtype=torch.long),
+                        torch.zeros(max_len - chunk_len, dtype=torch.long)
+                    ])
+                else:
+                    mask = torch.ones(max_len, dtype=torch.long)
+                batch_chunks.append(chunk)
+                attention_masks.append(mask)
+            
+            batch_tensor = torch.stack(batch_chunks)  # (batch, seq_len)
+            mask_tensor = torch.stack(attention_masks)  # (batch, seq_len)
+            
+            with torch.no_grad():
+                outputs = self._model(
+                    batch_tensor, 
+                    labels=batch_tensor,
+                    attention_mask=mask_tensor,
+                )
+                # For batched input, loss is averaged; we need per-sample losses
+                # Compute individual losses from logits
+                logits = outputs.logits  # (batch, seq, vocab)
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = batch_tensor[:, 1:].contiguous()
+                shift_masks = mask_tensor[:, 1:].contiguous()
+                
+                loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+                per_token_loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1)
+                ).view(shift_labels.size())  # (batch, seq-1)
+                
+                # Mask out padding and compute mean per sample
+                masked_loss = per_token_loss * shift_masks
+                sample_losses = masked_loss.sum(dim=1) / shift_masks.sum(dim=1).clamp(min=1)
+                window_losses.extend(sample_losses.tolist())
 
         mean_loss = sum(window_losses) / len(window_losses)
         ppl = math.exp(mean_loss)

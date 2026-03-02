@@ -44,3 +44,4 @@ logs/
 .ipynb_checkpoints/
 tmpclaude**
 nul
+data/history.db

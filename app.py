@@ -581,6 +581,7 @@ def _render_humanize_tab():
     # Show model selector when LLM strategy is chosen
     model_name = "mistral"
     h_config = None
+    output_format = "plain"  # Default for rule-based strategy
 
     if strategy == "llm":
         import requests as _req
@@ -698,19 +699,24 @@ def _render_humanize_tab():
         )
 
     if st.button("🔄 Humanize & Re-evaluate", type="primary"):
+        import time as _time
         doc = st.session_state["last_doc"]
         ai_before = st.session_state["last_ai_result"]
 
         humanizer = _load_humanizer()
+        start_time = _time.time()
 
         # --- Progress UI for LLM pipeline ---------------------------------
         if strategy == "llm":
             progress_bar = st.progress(0.0, text="Initialising LLM pipeline …")
             status_text = st.empty()
+            timer_display = st.empty()
 
             def _progress_cb(stage: str, pct: float):
+                elapsed = _time.time() - start_time
                 progress_bar.progress(min(pct, 1.0), text=stage)
                 status_text.caption(stage)
+                timer_display.markdown(f"⏱️ **Elapsed:** {elapsed:.1f}s")
 
             h_result = humanizer.humanize(
                 doc.cleaned_text,
@@ -719,11 +725,15 @@ def _render_humanize_tab():
                 progress_cb=_progress_cb,
                 config=h_config,
             )
+            elapsed_total = _time.time() - start_time
+            h_result.elapsed_seconds = elapsed_total
             progress_bar.progress(1.0, text="✅ Humanization complete")
+            timer_display.markdown(f"✅ **Completed in {elapsed_total:.1f}s**")
             status_text.empty()
         else:
             with st.spinner("Humanizing text …"):
                 h_result = humanizer.humanize(doc.cleaned_text, strategy=strategy, model=model_name)
+                h_result.elapsed_seconds = _time.time() - start_time
 
         with st.spinner("Final AI evaluation …"):
             detector = _load_ai_detector()
@@ -745,12 +755,17 @@ def _render_humanize_tab():
         ai_after = st.session_state["last_humanize_ai_after"]
 
         st.divider()
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("AI Prob. (Before)", f"{ai_before.ai_probability:.1%}")
         c2.metric("AI Prob. (After)", f"{ai_after.ai_probability:.1%}")
         delta = ai_before.ai_probability - ai_after.ai_probability
         c3.metric("Improvement", f"{delta:+.1%}")
         c4.metric("LLM Passes", h_result.passes_used if hasattr(h_result, "passes_used") else "—")
+        elapsed = getattr(h_result, "elapsed_seconds", 0)
+        if elapsed >= 60:
+            c5.metric("Time", f"{elapsed / 60:.1f}m")
+        else:
+            c5.metric("Time", f"{elapsed:.1f}s")
 
         if hasattr(h_result, "word_count_original") and h_result.word_count_original:
             st.caption(
