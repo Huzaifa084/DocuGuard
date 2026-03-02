@@ -54,6 +54,16 @@ class StyleResult:
 
 
 @dataclass
+class ParagraphScore:
+    """AI score for a single paragraph."""
+    index: int = 0
+    text_preview: str = ""
+    ai_probability: float = 0.0
+    perplexity: float = 0.0
+    word_count: int = 0
+
+
+@dataclass
 class AIDetectionResult:
     """Final combined result from the hybrid detector."""
     ai_probability: float = 0.0         # 0.0–1.0
@@ -62,6 +72,7 @@ class AIDetectionResult:
     style_result: StyleResult = field(default_factory=StyleResult)
     features: Dict[str, Any] = field(default_factory=dict)
     explanations: List[str] = field(default_factory=list)
+    paragraph_scores: List[ParagraphScore] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +434,9 @@ class AIDetector:
             ai_prob, ppl_result, style_result, features
         )
 
+        # 7. Per-paragraph breakdown
+        para_scores = self._paragraph_breakdown(text)
+
         return AIDetectionResult(
             ai_probability=round(ai_prob, 4),
             confidence=confidence,
@@ -430,9 +444,55 @@ class AIDetector:
             style_result=style_result,
             features=features,
             explanations=explanations,
+            paragraph_scores=para_scores,
         )
 
     # ---- helpers -----------------------------------------------------------
+
+    def _paragraph_breakdown(self, text: str) -> List[ParagraphScore]:
+        """Compute per-paragraph AI scores using perplexity + style."""
+        import re
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        if len(paragraphs) <= 1:
+            return []  # single-paragraph docs don't need breakdown
+
+        scores: List[ParagraphScore] = []
+        for idx, para in enumerate(paragraphs):
+            words = para.split()
+            if len(words) < 10:
+                # Too short for meaningful analysis
+                scores.append(ParagraphScore(
+                    index=idx,
+                    text_preview=para[:80],
+                    ai_probability=0.0,
+                    perplexity=0.0,
+                    word_count=len(words),
+                ))
+                continue
+
+            try:
+                ppl = self._perplexity.analyse(para)
+                feats = extract_features(para)
+                style = self._style.analyse(feats)
+                prob = self._classifier.predict(
+                    ppl.normalised_score, style, extract_feature_vector(para)
+                )
+                scores.append(ParagraphScore(
+                    index=idx,
+                    text_preview=para[:80],
+                    ai_probability=round(prob, 4),
+                    perplexity=round(ppl.perplexity, 2),
+                    word_count=len(words),
+                ))
+            except Exception:
+                scores.append(ParagraphScore(
+                    index=idx,
+                    text_preview=para[:80],
+                    ai_probability=0.0,
+                    perplexity=0.0,
+                    word_count=len(words),
+                ))
+        return scores
 
     @staticmethod
     def _confidence_level(ppl_score: float, uniformity: float, prob: float) -> str:

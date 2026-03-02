@@ -36,7 +36,7 @@ print(f"[OK] Humanizer (rule): {len(hr.changes_summary)} changes")
 # Test 6: Fingerprint
 from core.fingerprint import FingerprintEngine
 fp = FingerprintEngine()
-p = fp.create_profile("test_verify", ["This is sample text for fingerprinting."])
+p = fp.create_profile(["This is sample text for fingerprinting."], "test_verify")
 print(f"[OK] Fingerprint: {len(p.mean_vector)} dims")
 fp.delete_profile("test_verify")
 

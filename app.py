@@ -259,6 +259,126 @@ def _run_analysis_common(doc, filename: str, run_plagiarism: bool, run_fingerpri
     st.session_state["last_fp_result"] = fp_result
 
 
+# ---------------------------------------------------------------------------
+# Helper: inline diff rendering
+# ---------------------------------------------------------------------------
+def _render_inline_diff(original: str, humanized: str):
+    """Show a sentence-level inline diff using difflib."""
+    import difflib, html as _html
+
+    orig_sents = [s.strip() for s in original.replace("\n", " ").split(". ") if s.strip()]
+    hum_sents = [s.strip() for s in humanized.replace("\n", " ").split(". ") if s.strip()]
+    matcher = difflib.SequenceMatcher(None, orig_sents, hum_sents)
+    parts: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for s in orig_sents[i1:i2]:
+                parts.append(_html.escape(s) + ".")
+        elif tag == "replace":
+            for s in orig_sents[i1:i2]:
+                parts.append(f'<span style="background:#ffcccc;text-decoration:line-through">{_html.escape(s)}.</span>')
+            for s in hum_sents[j1:j2]:
+                parts.append(f'<span style="background:#ccffcc">{_html.escape(s)}.</span>')
+        elif tag == "delete":
+            for s in orig_sents[i1:i2]:
+                parts.append(f'<span style="background:#ffcccc;text-decoration:line-through">{_html.escape(s)}.</span>')
+        elif tag == "insert":
+            for s in hum_sents[j1:j2]:
+                parts.append(f'<span style="background:#ccffcc">{_html.escape(s)}.</span>')
+    st.markdown(" ".join(parts), unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Helper: generate PDF report bytes (HTML-based via simple markup)
+# ---------------------------------------------------------------------------
+def _generate_pdf_report(report: dict) -> bytes:
+    """Build a lightweight PDF from the analysis report using fpdf2."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        # Fallback: return an HTML file encoded as bytes if fpdf2 missing
+        return _generate_html_report_bytes(report)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, "DocuGuard+ Analysis Report", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Report ID: {report.get('report_id', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Generated: {report.get('timestamp', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Metadata section
+    meta = report.get("metadata", {})
+    if meta:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 8, "Document Metadata", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        for key in ("filename", "word_count", "char_count", "language"):
+            val = meta.get(key, "N/A")
+            pdf.cell(0, 6, f"  {key}: {val}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    # AI Detection section
+    ai = report.get("ai_detection", {})
+    if ai:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 8, "AI Detection", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"  AI Probability: {ai.get('ai_probability', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, f"  Confidence: {ai.get('confidence', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, f"  Mean Perplexity: {ai.get('mean_perplexity', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    # Plagiarism section
+    plag = report.get("plagiarism", {})
+    if plag:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 8, "Plagiarism Analysis", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"  Overall Score: {plag.get('overall_score', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+        sources = plag.get("matched_sources", [])
+        if sources:
+            pdf.cell(0, 6, f"  Matched Sources: {len(sources)}", new_x="LMARGIN", new_y="NEXT")
+            for src in sources[:10]:
+                if isinstance(src, dict):
+                    pdf.cell(0, 6, f"    - {src.get('source', 'unknown')} ({src.get('similarity', 0):.0%})", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    # Fingerprint section
+    fp = report.get("fingerprint", {})
+    if fp:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 8, "Style Fingerprint", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"  Similarity: {fp.get('similarity_score', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    return bytes(pdf.output())
+
+
+def _generate_html_report_bytes(report: dict) -> bytes:
+    """Fallback: generate an HTML report when fpdf2 is not installed."""
+    import json as _json
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>DocuGuard+ Report</title>
+<style>body{{font-family:sans-serif;margin:2em}}h1{{color:#1a237e}}
+table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:6px 10px;text-align:left}}
+th{{background:#e8eaf6}}</style></head><body>
+<h1>DocuGuard+ Analysis Report</h1>
+<p><b>Report ID:</b> {report.get('report_id','N/A')}</p>
+<p><b>Generated:</b> {report.get('timestamp','N/A')}</p>
+<h2>Full Report Data</h2>
+<pre>{_json.dumps(report, indent=2, default=str)}</pre>
+</body></html>"""
+    return html.encode("utf-8")
+
+
 def _display_results(report, doc, ai_result, plag_result, fp_result):
     st.divider()
     st.subheader("Analysis Results")
@@ -289,6 +409,26 @@ def _display_results(report, doc, ai_result, plag_result, fp_result):
 
     with tab_human:
         _render_humanize_tab()
+
+    # ---- Report download buttons ----
+    st.divider()
+    dl_cols = st.columns(2)
+    import json as _json
+    report_json = _json.dumps(report, indent=2, default=str)
+    dl_cols[0].download_button(
+        "📥 Download JSON Report",
+        data=report_json,
+        file_name=f"docuguard_report_{report.get('report_id', 'unknown')}.json",
+        mime="application/json",
+    )
+    # PDF export
+    pdf_bytes = _generate_pdf_report(report)
+    dl_cols[1].download_button(
+        "📄 Download PDF Report",
+        data=pdf_bytes,
+        file_name=f"docuguard_report_{report.get('report_id', 'unknown')}.pdf",
+        mime="application/pdf",
+    )
 
 
 def _render_ai_tab(ai_result, report):
@@ -333,6 +473,31 @@ def _render_ai_tab(ai_result, report):
         st.write(f"**Naturalness:** {sty.naturalness_score:.3f}")
         for f in sty.contributing_factors:
             st.markdown(f"- {f}")
+
+    # Per-paragraph breakdown (heatmap)
+    if hasattr(ai_result, "paragraph_scores") and ai_result.paragraph_scores:
+        with st.expander("📊 Per-Paragraph AI Breakdown", expanded=True):
+            st.caption(
+                "Each paragraph is scored independently.  "
+                "Red = likely AI, green = likely human."
+            )
+            for ps in ai_result.paragraph_scores:
+                prob_p = ps.ai_probability
+                if prob_p >= 0.75:
+                    badge = "🔴"
+                elif prob_p >= 0.45:
+                    badge = "🟡"
+                else:
+                    badge = "🟢"
+                preview = ps.text_preview.replace("\n", " ")
+                if len(preview) > 70:
+                    preview = preview[:70] + "…"
+                st.markdown(
+                    f"{badge} **¶{ps.index + 1}** — AI: **{prob_p:.0%}** · "
+                    f"PPL: {ps.perplexity:.0f} · {ps.word_count} words  \n"
+                    f"<span style='color:gray;font-size:0.85em'>{preview}</span>",
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_plagiarism_tab(plag_result):
@@ -503,6 +668,14 @@ def _render_humanize_tab():
                     help="More passes = better results but longer processing time.",
                 )
 
+            output_format = st.radio(
+                "Output Format",
+                options=["plain", "markdown"],
+                index=0,
+                horizontal=True,
+                help="Markdown adds headers, bold, and lists for better readability.",
+            )
+
         # Show word-count info
         _wc = len(st.session_state["last_doc"].cleaned_text.split())
         if _wc > MAX_WORD_LIMIT:
@@ -521,6 +694,7 @@ def _render_humanize_tab():
             custom_instructions=custom_instr.strip(),
             target_ai_prob=target_prob,
             max_passes=max_passes,
+            output_format=output_format,
         )
 
     if st.button("🔄 Humanize & Re-evaluate", type="primary"):
@@ -562,6 +736,7 @@ def _render_humanize_tab():
         st.session_state["last_humanize_result"] = h_result
         st.session_state["last_humanize_ai_before"] = ai_before
         st.session_state["last_humanize_ai_after"] = ai_after
+        st.session_state["last_humanize_format"] = output_format
 
     # --- Always render results from session state -------------------------
     if "last_humanize_result" in st.session_state:
@@ -588,14 +763,43 @@ def _render_humanize_tab():
             st.markdown(f"- {ch}")
 
         with st.expander("View Humanized Text", expanded=True):
-            st.text_area("Humanized output", h_result.humanized_text, height=300)
+            # Render as Markdown if that format was selected
+            if st.session_state.get("last_humanize_format") == "markdown":
+                st.markdown(h_result.humanized_text)
+            else:
+                st.text_area("Humanized output", h_result.humanized_text, height=300)
 
-        # Copy button
+        # Side-by-side diff view
+        with st.expander("📝 Side-by-Side Comparison"):
+            diff_col_a, diff_col_b = st.columns(2)
+            with diff_col_a:
+                st.markdown("**Original**")
+                st.text_area(
+                    "Original text",
+                    h_result.original_text,
+                    height=300,
+                    key="diff_original",
+                    label_visibility="collapsed",
+                )
+            with diff_col_b:
+                st.markdown("**Humanized**")
+                st.text_area(
+                    "Humanized text",
+                    h_result.humanized_text,
+                    height=300,
+                    key="diff_humanized",
+                    label_visibility="collapsed",
+                )
+            # Inline diff (highlighted sentence-level changes)
+            _render_inline_diff(h_result.original_text, h_result.humanized_text)
+
+        # Download button with appropriate extension
+        is_md = st.session_state.get("last_humanize_format") == "markdown"
         st.download_button(
             "📋 Download Humanized Text",
             data=h_result.humanized_text,
-            file_name="humanized_output.txt",
-            mime="text/plain",
+            file_name="humanized_output.md" if is_md else "humanized_output.txt",
+            mime="text/markdown" if is_md else "text/plain",
         )
 
 

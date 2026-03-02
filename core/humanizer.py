@@ -76,6 +76,7 @@ class HumanizationConfig:
     custom_instructions: str = ""       # free-form notes for the LLM
     target_ai_prob: float = 0.30        # stop once AI prob drops below this
     max_passes: int = 3                 # cap on LLM rewriting iterations
+    output_format: str = "plain"        # plain | markdown
 
 
 @dataclass
@@ -507,6 +508,8 @@ class Humanizer:
             4. Never begin with "Here is" / "Sure" / "Certainly" or similar.
             5. Do NOT add transition words (Moreover, Furthermore, Additionally, etc.).
             {extras_block}
+
+            {"OUTPUT FORMAT: Use Markdown formatting — use **bold** for emphasis, bullet lists where appropriate, and ## headings to structure sections. Make the output visually scannable." if cfg.output_format == "markdown" else "OUTPUT FORMAT: Plain text only — no Markdown formatting, no special characters for formatting."}
         """)
 
     # ------------------------------------------------------------------

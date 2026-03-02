@@ -149,7 +149,7 @@ sep("H. DATABASE LAYER (ChromaDB)")
 from db.corpus_store import add_document, list_documents, delete_document, corpus_count
 from db.history_store import add_analysis, list_analyses, analysis_count
 
-doc_id = add_document("pipeline_test_doc", doc.cleaned_text, {"source": "pipeline_test"})
+doc_id = add_document(doc.cleaned_text, "pipeline_test_doc", {"source": "pipeline_test"})
 print(f"  Added corpus doc: {doc_id}")
 print(f"  Corpus count:     {corpus_count()}")
 

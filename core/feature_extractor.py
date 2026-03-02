@@ -100,21 +100,44 @@ def extract_features(text: str) -> Dict[str, Any]:
     return features
 
 
-def extract_feature_vector(text: str) -> List[float]:
-    """Return ordered numeric feature values suitable for ML input.
+# Features excluded from the ML vector — document-length artifacts, not style
+_EXCLUDE_FROM_VECTOR: set[str] = {"sentence_count"}
 
-    Guarantees a deterministic key order so the vector is reproducible.
+
+def extract_feature_vector(text: str) -> List[float]:
+    """Return ordered, z-score-normalised numeric feature values for ML.
+
+    Excludes document-length artefacts (``sentence_count``) and applies
+    z-score normalisation so features with vastly different scales
+    (e.g. Yule's K 0-200 vs ratios 0-1) don't dominate the classifier.
     """
     feats = extract_features(text)
-    # Sort by key for deterministic ordering
-    return [float(v) for _, v in sorted(feats.items()) if isinstance(v, (int, float))]
+    # Sort by key for deterministic ordering, exclude non-style features
+    raw = [
+        float(v)
+        for k, v in sorted(feats.items())
+        if isinstance(v, (int, float)) and k not in _EXCLUDE_FROM_VECTOR
+    ]
+    # Z-score normalise (robust to zero-variance features)
+    if raw:
+        import numpy as _np
+        arr = _np.array(raw, dtype=_np.float64)
+        mu = arr.mean()
+        sigma = arr.std()
+        if sigma > 1e-9:
+            arr = (arr - mu) / sigma
+        raw = arr.tolist()
+    return raw
 
 
 def feature_names() -> List[str]:
     """Return the sorted list of numeric feature names (matches vector order)."""
     # Build a dummy feature dict to discover keys
     dummy = extract_features("The quick brown fox jumps over the lazy dog. " * 5)
-    return sorted(k for k, v in dummy.items() if isinstance(v, (int, float)))
+    return sorted(
+        k for k, v in dummy.items()
+        if isinstance(v, (int, float)) and k not in _EXCLUDE_FROM_VECTOR
+    )
 
 
 # ---------------------------------------------------------------------------
