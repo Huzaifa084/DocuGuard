@@ -67,6 +67,29 @@ def _sidebar():
         ["📄 Document Analysis", "📚 Corpus Management",
          "✍️ Style Profiles", "📊 Report History"],
     )
+
+    # ── LLM Backend URL ────────────────────────────────────────────────
+    st.sidebar.divider()
+    st.sidebar.markdown("**🔗 LLM Backend**")
+    default_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    ollama_url = st.sidebar.text_input(
+        "Ollama / Colab URL",
+        value=st.session_state.get("ollama_url", default_url),
+        placeholder="https://your-tunnel.trycloudflare.com",
+        help="Paste your Google Colab Cloudflare tunnel URL here, or keep the default for local Ollama.",
+    )
+    # Persist and propagate to env for humanizer module
+    st.session_state["ollama_url"] = ollama_url.rstrip("/")
+    os.environ["OLLAMA_URL"] = st.session_state["ollama_url"]
+
+    # Connection status indicator
+    try:
+        import requests as _rq
+        _rq.get(f"{st.session_state['ollama_url']}/api/tags", timeout=3)
+        st.sidebar.success("✅ Connected", icon="🟢")
+    except Exception:
+        st.sidebar.warning("⚠️ Not reachable", icon="🟡")
+
     st.sidebar.divider()
     st.sidebar.info(
         "**Disclaimer:** AI detection is *probabilistic*, not definitive. "
@@ -587,7 +610,7 @@ def _render_humanize_tab():
         import requests as _req
         from core.humanizer import HumanizationConfig, MAX_WORD_LIMIT
 
-        _ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        _ollama_url = st.session_state.get("ollama_url", os.environ.get("OLLAMA_URL", "http://localhost:11434"))
         # Dynamically fetch available models from Ollama
         _available_models: list[str] = []
         try:
@@ -671,7 +694,7 @@ def _render_humanize_tab():
 
             output_format = st.radio(
                 "Output Format",
-                options=["plain", "markdown"],
+                options=["markdown", "plain"],
                 index=0,
                 horizontal=True,
                 help="Markdown adds headers, bold, and lists for better readability.",

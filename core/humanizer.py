@@ -39,7 +39,10 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+def _get_ollama_url() -> str:
+    """Return the current Ollama URL (supports dynamic Colab tunnel URLs)."""
+    return os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+
 DEFAULT_MODEL = os.environ.get("DEFAULT_OLLAMA_MODEL", "mistral")
 
 # Hard word-count limit — keeps LLM processing tractable
@@ -518,7 +521,7 @@ class Humanizer:
             5. Do NOT add transition words (Moreover, Furthermore, Additionally, etc.).
             {extras_block}
 
-            {"OUTPUT FORMAT: Use Markdown formatting — use **bold** for emphasis, bullet lists where appropriate, and ## headings to structure sections. Make the output visually scannable." if cfg.output_format == "markdown" else "OUTPUT FORMAT: Plain text only — no Markdown formatting, no special characters for formatting."}
+            {"OUTPUT FORMAT: Use clean Markdown formatting throughout the output. Rules:" + chr(10) + "            - Use **bold** for key terms and emphasis" + chr(10) + "            - Use *italics* for nuanced or softer emphasis" + chr(10) + "            - Use bullet lists (- item) when listing related points" + chr(10) + "            - Use ## and ### headings to structure major sections if the text has clear sections" + chr(10) + "            - Use > blockquotes for important callouts or definitions" + chr(10) + "            - Keep paragraphs well-separated with blank lines" + chr(10) + "            - Make the output visually scannable and reader-friendly" + chr(10) + "            - Do NOT wrap the entire output in a code block" if cfg.output_format == "markdown" else "OUTPUT FORMAT: Plain text only — no Markdown formatting, no special characters for formatting."}
         """)
 
     # ------------------------------------------------------------------
@@ -554,7 +557,7 @@ class Humanizer:
         for attempt in range(1, max_retries + 1):
             try:
                 resp = requests.post(
-                    f"{OLLAMA_URL}/api/chat", json=payload, timeout=timeout,
+                    f"{_get_ollama_url()}/api/chat", json=payload, timeout=timeout,
                 )
                 resp.raise_for_status()
                 data = resp.json()
