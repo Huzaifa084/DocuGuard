@@ -219,7 +219,65 @@ For **5-8x faster** humanization using Google Colab's free T4 GPU:
 
 ---
 
-## 📁 Project Structure
+## � MCP Debug Server (Remote Monitoring)
+
+The notebook includes a **MCP Debug Server** — a lightweight FastAPI service that lets VS Code Copilot (or you) remotely monitor and debug the Colab runtime without copy-pasting errors.
+
+### How It Works
+
+```
+Google Colab
+    ├── Ollama Server (:11434) → Cloudflare Tunnel → Ollama URL
+    └── MCP Debug Server (:8000) → Cloudflare Tunnel → MCP URL
+
+VS Code (Local)
+    └── colab_bridge.py --url <MCP_URL> <command>
+```
+
+### Available Commands
+
+```bash
+# Full status report (Ollama + GPU + system + errors)
+python colab_bridge.py --url https://YOUR-MCP-URL.trycloudflare.com status
+
+# Check GPU memory and utilization
+python colab_bridge.py --url <URL> gpu
+
+# Check Ollama health and loaded models
+python colab_bridge.py --url <URL> ollama
+
+# Read last 100 lines of Ollama log
+python colab_bridge.py --url <URL> logs 100
+
+# Get last error traceback (no copy-pasting!)
+python colab_bridge.py --url <URL> error
+
+# Execute Python code remotely on Colab
+python colab_bridge.py --url <URL> run "print(1+1)"
+
+# Execute a local script on Colab
+python colab_bridge.py --url <URL> run-file fix_script.py
+
+# Run full connectivity + inference test
+python colab_bridge.py --url <URL> test
+```
+
+### MCP Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Server health + uptime |
+| `/run_cell` | POST | Execute Python code (`{"code": "..."}`) |
+| `/get_last_error` | GET | Last error traceback |
+| `/get_gpu_usage` | GET | nvidia-smi parsed output |
+| `/get_ollama_status` | GET | Ollama health + model list |
+| `/get_logs?lines=N` | GET | Last N lines of Ollama log |
+| `/get_system_info` | GET | CPU, RAM, disk stats |
+| `/get_execution_history?last=N` | GET | Recent execution results |
+
+---
+
+## �📁 Project Structure
 
 ```
 DocuGuard/
@@ -238,7 +296,8 @@ DocuGuard/
 │   └── history_store.py        # SQLite analysis history
 ├── utils/
 │   └── text_utils.py           # Sentence splitting, helpers
-├── docuguard_colab_gpu.ipynb   # Google Colab GPU notebook
+├── docuguard_colab_gpu.ipynb   # Google Colab GPU notebook (+ MCP server)
+├── colab_bridge.py             # Local CLI for remote Colab debugging
 ├── docker-compose.yml          # Docker setup (app + Ollama)
 ├── Dockerfile                  # App container
 ├── requirements.txt            # Python dependencies
