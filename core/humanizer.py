@@ -54,7 +54,7 @@ _GENERATION_OPTIONS: dict[str, Any] = {
     "top_p": 0.92,               # Nucleus sampling
     "top_k": 60,
     "repeat_penalty": 1.25,      # Discourage verbatim repetitions
-    "num_predict": 2048,         # Max tokens per generation
+    "num_predict": 4096,         # Max tokens per generation (raised to avoid mid-sentence truncation)
 }
 
 # Thresholds
@@ -95,6 +95,10 @@ class HumanizationResult:
     word_count_humanized: int = 0
     passes_used: int = 0
     elapsed_seconds: float = 0.0        # Total processing time
+    paragraphs_total: int = 0
+    paragraphs_rewritten: int = 0
+    paragraphs_skipped: int = 0
+    skip_reasons: List[str] = field(default_factory=list)
 
 
 # Type alias for an optional progress callback (stage_name, pct)
@@ -327,12 +331,15 @@ class Humanizer:
         n_paras = len(paragraphs)
         log.info("LLM humanize: %d paragraphs, model=%s", n_paras, model)
 
-        draft = self._rewrite_all_paragraphs(
+        draft, para_stats = self._rewrite_all_paragraphs(
             paragraphs, model, sys_prompt, _cb,
             progress_start=0.05, progress_end=0.45,
         )
         passes_used += 1
-        changes.append(f"Pass 1: rewrote {n_paras} paragraphs via {model}")
+        changes.append(
+            f"Pass 1: rewrote {para_stats['rewritten']}/{para_stats['total']} paragraphs via {model}"
+            + (f" ({para_stats['skipped']} kept as-is)" if para_stats['skipped'] else "")
+        )
 
         # ── Iterative AI-detection gate + targeted passes ───────────────
         for pass_num in range(2, max_passes + 1):
@@ -393,6 +400,10 @@ class Humanizer:
             strategy="llm",
             changes_summary=changes,
             passes_used=passes_used,
+            paragraphs_total=para_stats["total"],
+            paragraphs_rewritten=para_stats["rewritten"],
+            paragraphs_skipped=para_stats["skipped"],
+            skip_reasons=para_stats["reasons"],
         )
 
     # ------------------------------------------------------------------
@@ -479,7 +490,15 @@ class Humanizer:
                 f"{bullet_list}"
             )
 
-        # ── Domain / keywords / custom ──────────────────────────────────
+        # ── Custom instructions block (shown BEFORE hard rules so LLM treats them as priority) ──
+        user_instructions_block = ""
+        if cfg.custom_instructions:
+            user_instructions_block = (
+                f"\n\nUSER INSTRUCTIONS — these take highest priority and override the defaults below:\n"
+                f"{cfg.custom_instructions}"
+            )
+
+        # ── Domain / keywords (constraints that stay after hard rules) ──────
         extras: List[str] = []
         if cfg.domain:
             extras.append(f"The text is about **{cfg.domain}**.  Use domain-appropriate vocabulary.")
@@ -488,8 +507,6 @@ class Humanizer:
                 f"These terms MUST appear verbatim (do not paraphrase them): "
                 f"{cfg.preserve_keywords}"
             )
-        if cfg.custom_instructions:
-            extras.append(f"Additional user instructions: {cfg.custom_instructions}")
         extras_block = "\n".join(extras)
         if extras_block:
             extras_block = "\n\n" + extras_block
@@ -502,6 +519,7 @@ class Humanizer:
             TONE: {tone_text}
 
             INTENSITY: {intensity_text}
+            {user_instructions_block}
 
             AI-generated text has these detectable patterns — BREAK them:
             • Uniform sentence lengths → vary dramatically (3-word punchy + 30-word complex)
@@ -513,12 +531,16 @@ class Humanizer:
             • Overuse of passive voice → prefer active constructions
             {issues_block}
 
-            HARD RULES:
+            HARD RULES (if any USER INSTRUCTIONS above conflict with these rules, follow the user instructions):
             1. Output ONLY the rewritten text.  No preamble, commentary, labels, or meta-text.
             2. Preserve ALL factual content, claims, and nuance.
-            3. Keep roughly the same length (within ±20 %).
+            3. Keep roughly the same length (within ±20 %) unless the user instructions specify a different structure or format.
             4. Never begin with "Here is" / "Sure" / "Certainly" or similar.
             5. Do NOT add transition words (Moreover, Furthermore, Additionally, etc.).
+            6. Do NOT include ANY commentary, notes, or self-referential text ANYWHERE in the output — not at the start, middle, or end. Every single line must be rewritten content only.
+            7. Do NOT invent new headings, titles, or section labels that do not already exist in the input text.
+            8. Do NOT insert horizontal rules (---), separator lines, or structural dividers not present in the original.
+            9. Do NOT write self-referential sentences such as "Please note that...", "As an expert...", "Here's a rewritten version...", "I'll be focusing on...", "I have rewritten...", "I've rewritten...", or any similar meta-commentary.
             {extras_block}
 
             {"OUTPUT FORMAT: Use clean Markdown formatting throughout the output. Rules:" + chr(10) + "            - Use **bold** for key terms and emphasis" + chr(10) + "            - Use *italics* for nuanced or softer emphasis" + chr(10) + "            - Use bullet lists (- item) when listing related points" + chr(10) + "            - Use ## and ### headings to structure major sections if the text has clear sections" + chr(10) + "            - Use > blockquotes for important callouts or definitions" + chr(10) + "            - Keep paragraphs well-separated with blank lines" + chr(10) + "            - Make the output visually scannable and reader-friendly" + chr(10) + "            - Do NOT wrap the entire output in a code block" if cfg.output_format == "markdown" else "OUTPUT FORMAT: Plain text only — no Markdown formatting, no special characters for formatting."}
@@ -587,17 +609,31 @@ class Humanizer:
         progress_cb: Callable,
         progress_start: float = 0.05,
         progress_end: float = 0.45,
-    ) -> str:
-        """Rewrite every paragraph, passing neighbouring context."""
+    ) -> tuple:
+        """Rewrite every paragraph, passing neighbouring context.
+
+        Returns a tuple (rewritten_text: str, stats: dict) where stats contains:
+          - total: total paragraph count
+          - rewritten: how many were successfully rewritten by LLM
+          - skipped: how many were kept as original
+          - reasons: list of human-readable skip reason strings
+        """
         n = len(paragraphs)
         rewritten: List[str] = []
+        stats: dict = {"total": n, "rewritten": 0, "skipped": 0, "reasons": []}
 
         for idx, para in enumerate(paragraphs):
             pct = progress_start + (idx / max(n, 1)) * (progress_end - progress_start)
             progress_cb(f"Rewriting paragraph {idx + 1}/{n} …", pct)
 
-            if len(para.split()) < 5:
+            para_word_count = len(para.split())
+            if para_word_count < 5:
+                # Preserve structural lines (headings, TOC entries, labels, references) as-is
                 rewritten.append(para)
+                stats["skipped"] += 1
+                stats["reasons"].append(
+                    f"Para {idx + 1}: preserved structural — too short to rewrite ({para_word_count} words)"
+                )
                 continue
 
             # Build context window: previous (REWRITTEN) + next (original) paragraph
@@ -624,26 +660,114 @@ class Humanizer:
                 if not result or result_words < para_words * 0.3:
                     log.warning("Paragraph %d: LLM output too short (%d vs %d), keeping original", idx, result_words, para_words)
                     rewritten.append(para)
+                    stats["skipped"] += 1
+                    stats["reasons"].append(f"Para {idx + 1}: skipped — LLM output too short ({result_words} words vs {para_words} expected)")
                 elif result_words > para_words * 3:
                     log.warning("Paragraph %d: LLM output too long (%d vs %d), keeping original", idx, result_words, para_words)
                     rewritten.append(para)
+                    stats["skipped"] += 1
+                    stats["reasons"].append(f"Para {idx + 1}: skipped — LLM output too long ({result_words} words vs {para_words} expected)")
                 else:
-                    # Strip meta-commentary prefixes
-                    result_lower = result.lower().lstrip()
-                    if result_lower.startswith(("here", "sure", "certainly", "i've", "i have", "the rewritten")):
-                        # Find first newline or period and skip the preamble
-                        for sep in ("\n\n", "\n", ". "):
-                            if sep in result:
-                                result = result.split(sep, 1)[1]
-                                break
+                    # Strip meta-commentary and LLM artifacts anywhere in output
+                    result = self._strip_llm_artifacts(result)
                     # Strip any accidentally included context paragraphs
                     result = self._strip_context_leakage(result, paragraphs, rewritten, idx)
-                    rewritten.append(result)
+                    if not result.strip():
+                        # Artifact stripping removed everything — keep original
+                        log.warning("Paragraph %d: artifact stripping removed all content, keeping original", idx)
+                        rewritten.append(para)
+                        stats["skipped"] += 1
+                        stats["reasons"].append(f"Para {idx + 1}: skipped — output was entirely meta-commentary")
+                    else:
+                        rewritten.append(result)
+                        stats["rewritten"] += 1
             except Exception as exc:
                 log.warning("Paragraph %d rewrite failed: %s", idx, exc)
                 rewritten.append(para)
+                stats["skipped"] += 1
+                stats["reasons"].append(f"Para {idx + 1}: skipped — Ollama error: {exc}")
 
-        return "\n\n".join(rewritten)
+        return "\n\n".join(rewritten), stats
+
+    @staticmethod
+    def _strip_llm_artifacts(result: str) -> str:
+        """Remove LLM meta-commentary and spurious artifacts from anywhere in the output.
+
+        Handles:
+        - Self-referential commentary ("Please note that I've...", "As an expert...")
+        - Preamble lines at the start ("Here is...", "Sure, certainly...")
+        - Spurious horizontal rules (---)
+        - Broken markdown headers injected by the LLM (#### [Example]**)
+        - Fake document titles invented by the LLM (**Authenticating Text:**)
+        """
+        # ── Patterns that mark an entire LINE as meta-commentary ──────────
+        META_LINE_PATTERNS = [
+            r'^please note',
+            r'^note\s*:',
+            r'^as an expert',
+            r"^i'?ll be focusing",
+            r"^i'?ve rewritten",
+            r'^i have rewritten',
+            r"^here'?s a rewritten",
+            r'^here is (the|a|my) rewritten',
+            r'^here is (the|a|my) revised',
+            r'^the rewritten (paragraph|text|version)',
+            r'^rewritten (paragraph|text|version)',
+            r'^authenticating text',
+            r'^\*\*authenticating',
+            r'^this is a rewrite',
+            r'^sure[,!]',
+            r'^certainly[,!]',
+            r'^of course[,!]',
+            r'^---+\s*$',           # bare horizontal rule
+            r'^\*{3,}\s*$',         # bare *** line
+        ]
+        # ── Patterns that mark CONTENT appended after rewrite output ──────
+        SUFFIX_PATTERNS = [
+            r'please note that i.{0,60}(rewritten|revised|rephras)',
+            r'as an expert writing coach',
+            r"i'?ll be focusing on rewriting",
+            r"i'?ve rewritten (your|the) (paragraph|text|document)",
+            r"here'?s a rewritten version",
+            r'total processing duration',
+        ]
+
+        lines = result.split("\n")
+        cleaned: List[str] = []
+        for line in lines:
+            line_lo = line.strip().lower()
+            is_meta = any(re.match(pat, line_lo) for pat in META_LINE_PATTERNS)
+            if not is_meta:
+                # Also strip spurious broken markdown injected by LLM:
+                # e.g. "#### [Example]** Least Response Time **:**"
+                line = re.sub(r'^#{1,6}\s*\[.*?\]\*{1,2}\s*', '', line)  # #### [Tag]**
+                line = re.sub(r'^\*{2}[^*]{1,60}:\*{2}\s*$', '', line)   # **Fake Title:**
+                cleaned.append(line)
+
+        result = "\n".join(cleaned).strip()
+
+        # Cut off trailing meta-suffix blocks
+        for pat in SUFFIX_PATTERNS:
+            match = re.search(pat, result, re.IGNORECASE)
+            if match:
+                result = result[:match.start()].rstrip()
+                break
+
+        # Strip leading preamble (first line is commentary)
+        if result:
+            first_lo = result.lstrip().lower()
+            preamble_starts = (
+                "here", "sure", "certainly", "of course",
+                "i've", "i have", "the rewritten", "please note",
+                "as an expert", "authenticating",
+            )
+            if first_lo.startswith(preamble_starts):
+                for sep in ("\n\n", "\n", ". "):
+                    if sep in result:
+                        result = result.split(sep, 1)[1].lstrip()
+                        break
+
+        return result.strip()
 
     @staticmethod
     def _strip_context_leakage(
@@ -880,22 +1004,46 @@ class Humanizer:
 # Paragraph & diagnosis helpers
 # ---------------------------------------------------------------------------
 
+def _is_structural_block(text: str) -> bool:
+    """Return True if text looks like a heading, TOC entry, or reference list (not prose).
+
+    Structural blocks should be preserved verbatim, not merged with prose paragraphs.
+    Heuristic: average words-per-line < 10 AND no sentence-ending punctuation in most lines.
+    """
+    lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+    if not lines:
+        return False
+    avg_words = sum(len(ln.split()) for ln in lines) / len(lines)
+    sentence_lines = sum(1 for ln in lines if re.search(r'[.!?]\s*$', ln))
+    sentence_ratio = sentence_lines / len(lines)
+    return avg_words < 10 and sentence_ratio < 0.3
+
+
 def _split_into_paragraphs(text: str) -> List[str]:
     """Split text into paragraphs, keeping minimum ~3 sentences each.
 
     If the text has no blank-line breaks, split at every 3-5 sentences so
     each chunk is manageable for the LLM.
+
+    Structural blocks (TOC, headings, reference lists) are never merged
+    with surrounding prose — they are preserved as separate items.
     """
     # Try natural paragraph breaks first
     raw_paras = re.split(r"\n\s*\n", text.strip())
     raw_paras = [p.strip() for p in raw_paras if p.strip()]
 
     if len(raw_paras) >= 2:
-        # Merge very short paragraphs together
+        # Merge very short PROSE paragraphs together, but never merge structural blocks
         merged: List[str] = []
         for p in raw_paras:
-            if merged and len(merged[-1].split()) < 30:
-                merged[-1] = merged[-1] + " " + p
+            prev_is_structural = merged and _is_structural_block(merged[-1])
+            curr_is_structural = _is_structural_block(p)
+            # Only merge if neither the current nor previous block is structural
+            if (merged
+                    and not prev_is_structural
+                    and not curr_is_structural
+                    and len(merged[-1].split()) < 30):
+                merged[-1] = merged[-1] + "\n\n" + p
             else:
                 merged.append(p)
         return merged

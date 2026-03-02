@@ -800,6 +800,35 @@ def _render_humanize_tab():
         for ch in h_result.changes_summary:
             st.markdown(f"- {ch}")
 
+        # Processing Report — shows paragraph-level processing transparency
+        para_total = getattr(h_result, "paragraphs_total", 0)
+        if para_total > 0:
+            para_rewritten = getattr(h_result, "paragraphs_rewritten", 0)
+            para_skipped = getattr(h_result, "paragraphs_skipped", 0)
+            skip_reasons = getattr(h_result, "skip_reasons", [])
+            wc_orig = getattr(h_result, "word_count_original", 0)
+            wc_hum = getattr(h_result, "word_count_humanized", 0)
+            wc_delta = wc_hum - wc_orig
+            wc_delta_str = f"{wc_delta:+,}" if wc_orig else ""
+            pct_rewritten = para_rewritten / para_total * 100 if para_total else 0
+
+            with st.expander("Processing Report", expanded=False):
+                st.markdown(
+                    f"**Word count:** {wc_orig:,} → {wc_hum:,} ({wc_delta_str} words, "
+                    f"{(wc_hum / wc_orig * 100 - 100):+.1f}%)" if wc_orig else f"**Word count:** {wc_hum:,}"
+                )
+                st.markdown(
+                    f"**Paragraphs:** {para_total} total — "
+                    f"{para_rewritten} rewritten ({pct_rewritten:.0f}%), "
+                    f"{para_skipped} kept as-is"
+                )
+                if skip_reasons:
+                    st.markdown("**Paragraphs kept unchanged (with reason):**")
+                    for reason in skip_reasons:
+                        st.markdown(f"- {reason}")
+                else:
+                    st.success("All paragraphs were successfully rewritten.")
+
         with st.expander("View Humanized Text", expanded=True):
             # Render as Markdown if that format was selected
             if st.session_state.get("last_humanize_format") == "markdown":
